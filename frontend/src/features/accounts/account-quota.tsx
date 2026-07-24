@@ -107,7 +107,26 @@ export function ConsoleQuota({ windows, locale }: { windows: NonNullable<Account
   const { t } = useTranslation();
   const window = windows.find((value) => value.mode === "console") ?? windows[0];
   if (!window) return <span className="text-xs text-muted-foreground">{t("accounts.quotaNotSynced")}</span>;
-  return <WebQuotaMode mode="Console" window={window} locale={locale} />;
+  // Console local window is an open/closed availability flag (not a fixed request budget).
+  // remaining > 0 => schedulable; remaining == 0 => cooling until resetAt after upstream limit.
+  const open = window.remaining > 0;
+  const resetLabel = window.resetAt ? formatDateTime(window.resetAt, locale) : "";
+  return (
+    <div className="w-full min-w-0 space-y-1">
+      <div className="flex items-center justify-between gap-2 text-[11px]">
+        <span className={open ? "font-medium text-emerald-700 dark:text-emerald-300" : "font-medium text-amber-700 dark:text-amber-300"}>
+          {open ? t("console.availabilityOpen") : t("console.availabilityCooling")}
+        </span>
+      </div>
+      {open ? (
+        <div className="text-[10px] text-muted-foreground">{t("console.availabilityHint")}</div>
+      ) : (
+        <div className="text-[10px] text-muted-foreground">
+          {resetLabel ? t("accounts.waitingResetUntil", { time: resetLabel }) : t("accounts.quotaResetUnknown")}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function WebQuota({ windows, locale, tier }: { windows: NonNullable<AccountDTO["quotaWindows"]>; locale: string; tier?: AccountDTO["webTier"] }) {
