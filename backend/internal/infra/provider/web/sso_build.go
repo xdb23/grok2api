@@ -24,12 +24,16 @@ import (
 const (
 	ssoBuildClientID = "b1a00492-073a-47ea-816f-4c329264a828"
 	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
-	ssoAccountsURL   = "https://accounts.x.ai/"
-	ssoDeviceURL     = "https://auth.x.ai/oauth2/device/code"
-	ssoVerifyURL     = "https://auth.x.ai/oauth2/device/verify"
-	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
-	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
-	maxAuthBody      = 2 << 20
+	// ssoBuildClientVersion is sent on Device OAuth requests. New principals may
+	// require a recent grok-shell version (e.g. 0.2.111) for grok-4.5 grants.
+	ssoBuildClientVersion    = "0.2.111"
+	ssoBuildClientIdentifier = "grok-shell"
+	ssoAccountsURL           = "https://accounts.x.ai/"
+	ssoDeviceURL             = "https://auth.x.ai/oauth2/device/code"
+	ssoVerifyURL             = "https://auth.x.ai/oauth2/device/verify"
+	ssoApproveURL            = "https://auth.x.ai/oauth2/device/approve"
+	ssoTokenURL              = "https://auth.x.ai/oauth2/token"
+	maxAuthBody              = 2 << 20
 )
 
 type ssoBuildHTTPClient interface {
@@ -248,6 +252,9 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 		request.Header.Set("User-Agent", firstValue(f.userAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"))
 		request.Header.Set("Cookie", f.cookieHeader())
+		// Critical for newer principals / grok-4.5 Build grants on device OAuth.
+		request.Header.Set("x-grok-client-version", ssoBuildClientVersion)
+		request.Header.Set("x-grok-client-identifier", ssoBuildClientIdentifier)
 		// Browser-like headers for accounts.x.ai / auth.x.ai device OAuth (matches local mint).
 		if host := request.URL.Host; strings.Contains(host, "x.ai") {
 			request.Header.Set("Origin", "https://accounts.x.ai")
