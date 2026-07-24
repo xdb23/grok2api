@@ -59,15 +59,42 @@ export function RequestAuditDetailDialog({ audit, open, onOpenChange }: { audit:
               <AttemptDetail key={selectedAttempt.id} attempt={selectedAttempt} />
             </div>
           ) : (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-              <TriangleAlert className="size-7 stroke-1" />
-              <p>{t("audits.noFailureAttempts")}</p>
-              {detailQuery.data.audit.errorCode ? <span className="max-w-full break-words">{detailQuery.data.audit.errorCode}</span> : null}
-            </div>
+            <AuditLevelErrorPanel audit={detailQuery.data.audit} />
           )
         ) : null}
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Soft failures (stream interrupt, unavailable) often have no attempt rows — still show actionable error detail. */
+function AuditLevelErrorPanel({ audit }: { audit: AuditDTO }) {
+  const { t, i18n } = useTranslation();
+  const summary = [
+    { label: t("audits.status"), value: String(audit.statusCode || "-") },
+    { label: t("audits.errorCode"), value: audit.errorCode || t("audits.noFailureAttempts") },
+    { label: t("audits.model"), value: audit.modelPublicId || audit.modelUpstreamModel || "-" },
+    { label: t("audits.account"), value: audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-") },
+    { label: t("audits.key"), value: audit.clientKeyName || (audit.clientKeyId ? `#${audit.clientKeyId}` : "-") },
+    { label: t("audits.duration"), value: `${formatNumber(audit.durationMs, i18n.language)} ms` },
+    { label: t("audits.egress"), value: [audit.egressMode, audit.egressNodeName, audit.egressScope].filter(Boolean).join(" · ") || "-" },
+  ];
+  return (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-5 pb-5">
+      <div className="flex items-center gap-2 py-3 text-destructive">
+        <TriangleAlert className="size-4 shrink-0" />
+        <p className="min-w-0 truncate font-medium">{audit.errorCode || t("audits.noFailureAttempts")}</p>
+      </div>
+      <div className="grid min-h-0 flex-1 gap-x-10 gap-y-4 overflow-y-auto sm:grid-cols-2">
+        {summary.map((item) => (
+          <div key={item.label} className="min-w-0">
+            <p className="text-muted-foreground">{item.label}</p>
+            <p className="mt-1 break-all" title={item.value}>{item.value}</p>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 shrink-0 text-[11px] text-muted-foreground">{t("audits.softFailureHint")}</p>
+    </div>
   );
 }
 

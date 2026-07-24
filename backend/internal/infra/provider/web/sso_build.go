@@ -86,7 +86,8 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		return provider.CredentialSeed{}, fmt.Errorf("校验 Grok Web SSO 失败: %w", conversionHTTPError{status: status})
 	}
 
-	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
+	// Align with production mint: referrer=grok-build is required by some grant paths.
+	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}, "referrer": {"grok-build"}}
 	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
 	if err != nil {
 		return provider.CredentialSeed{}, err
@@ -131,8 +132,10 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	if !strings.Contains(finalURL, "consent") {
 		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
 	}
+	// principal_id should match the SSO user when known (empty is accepted by some tenants).
+	principalID := strings.TrimSpace(credential.UserID)
 	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoApproveURL, url.Values{
-		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
+		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {principalID},
 	})
 	if err != nil {
 		return provider.CredentialSeed{}, err
@@ -243,8 +246,16 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		}
 		request.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
 		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-		request.Header.Set("User-Agent", f.userAgent)
+		request.Header.Set("User-Agent", firstValue(f.userAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"))
 		request.Header.Set("Cookie", f.cookieHeader())
+		// Browser-like headers for accounts.x.ai / auth.x.ai device OAuth (matches local mint).
+		if host := request.URL.Host; strings.Contains(host, "x.ai") {
+			request.Header.Set("Origin", "https://accounts.x.ai")
+			request.Header.Set("Referer", "https://accounts.x.ai/")
+			request.Header.Set("Sec-Fetch-Dest", "empty")
+			request.Header.Set("Sec-Fetch-Mode", "cors")
+			request.Header.Set("Sec-Fetch-Site", "same-site")
+		}
 		if currentForm != nil {
 			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}

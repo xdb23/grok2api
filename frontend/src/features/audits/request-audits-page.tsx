@@ -450,17 +450,16 @@ function StatusCode({ statusCode, hasError = false }: { statusCode: number; hasE
 function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void }) {
   const { t } = useTranslation();
   const mode = audit.operation === "compaction" ? t("audits.operations.compaction") : audit.streaming ? t("audits.stream") : t("audits.nonStream");
+  // Soft failures (2xx + errorCode) and hard HTTP failures open the diagnostics dialog.
   const hasIssue = Boolean(audit.errorCode) || audit.attemptCount > 0 || audit.statusCode < 200 || audit.statusCode >= 300;
   const content = (
     <>
       <StatusCode statusCode={audit.statusCode} hasError={hasIssue} />
-      {audit.errorCode ? (
-        <span className="block max-w-[9rem] truncate whitespace-nowrap text-[10px] font-medium text-amber-700 dark:text-amber-300" title={audit.errorCode}>{audit.errorCode}</span>
-      ) : (
-        <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
-      )}
+      <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
     </>
   );
+  // Always clickable when there is anything to diagnose; keep the status column clean
+  // and put the real error body / transport detail inside the dialog.
   if (!hasIssue) return <div className="space-y-0.5 text-center">{content}</div>;
   return (
     <Tooltip>
@@ -468,9 +467,8 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
         <button type="button" className="group space-y-0.5 rounded-md text-center outline-none focus-visible:ring-2 focus-visible:ring-ring/50 [&>span:last-child]:underline-offset-2 hover:[&>span:last-child]:text-foreground hover:[&>span:last-child]:underline" aria-label={t("audits.openDiagnostics")} onClick={onOpen}>{content}</button>
       </TooltipTrigger>
       <TooltipContent className="max-w-80 whitespace-normal break-words text-left leading-5" side="top">
-        <div className="font-medium">{audit.errorCode || t("audits.openDiagnostics")}</div>
-        {audit.attemptCount > 0 ? <div className="mt-1 text-primary-foreground/70">{t("audits.failedAttemptCount", { count: audit.attemptCount })}</div> : null}
-        <div className="mt-1 text-primary-foreground/70">{t("audits.clickForDiagnostics")}</div>
+        <div>{t("audits.clickForDiagnostics")}</div>
+        {audit.errorCode ? <div className="mt-1 text-primary-foreground/70">{audit.errorCode}</div> : null}
       </TooltipContent>
     </Tooltip>
   );
