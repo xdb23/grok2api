@@ -388,7 +388,9 @@ function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
   if (audit.operation === "video") {
     return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.secondsCount", { count: audit.mediaOutputSeconds })} />;
   }
-  if (audit.operation === "image" || audit.operation === "image_edit" || audit.mediaInputImages > 0 || audit.mediaOutputImages > 0) {
+  // Image generation/edit APIs only show media counts. Conversation requests that
+  // happen to include input images still need the normal token breakdown.
+  if (audit.operation === "image" || audit.operation === "image_edit") {
     return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.imageCount", { count: audit.mediaOutputImages })} />;
   }
   const items = [
@@ -407,9 +409,11 @@ function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
           </div>
         ))}
       </div>
-      {audit.numSourcesUsed > 0 ? (
+      {(audit.mediaInputImages > 0 || audit.mediaOutputImages > 0 || audit.numSourcesUsed > 0) ? (
         <div className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
-          <span>{t("audits.sources", { count: audit.numSourcesUsed })}</span>
+          {audit.mediaInputImages > 0 ? <span>{t("audits.mediaInput")}: {t("audits.imageCount", { count: audit.mediaInputImages })}</span> : null}
+          {audit.mediaOutputImages > 0 ? <span>{t("audits.output")}: {t("audits.imageCount", { count: audit.mediaOutputImages })}</span> : null}
+          {audit.numSourcesUsed > 0 ? <span>{t("audits.sources", { count: audit.numSourcesUsed })}</span> : null}
         </div>
       ) : null}
     </div>

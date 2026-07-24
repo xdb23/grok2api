@@ -29,4 +29,7 @@ func TestConsoleRoutesUseStableProviderNamespace(t *testing.T) {
 	if !seen["Console/grok-4.3"] {
 		t.Fatal("canonical Console/grok-4.3 route is missing")
 	}
+	if !seen["Console/grok-4.5"] {
+		t.Fatal("canonical Console/grok-4.5 route is missing")
+	}
 }

@@ -81,6 +81,9 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 }
 
 func (a *Adapter) SyncQuota(_ context.Context, credential account.Credential) (provider.QuotaSnapshot, error) {
+	// Local Console windows are availability flags, not fixed request budgets.
+	// Open accounts report remaining>0; exhausted accounts keep remaining=0 until
+	// ResetAt via preserveActiveQuotaWindows / quota recovery, then reopen here.
 	now := time.Now().UTC()
 	resetAt := now.Add(DefaultQuotaWindow * time.Second)
 	return provider.QuotaSnapshot{SyncedAt: now, Windows: []account.QuotaWindow{{

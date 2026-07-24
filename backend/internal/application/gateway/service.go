@@ -930,17 +930,21 @@ attemptLoop:
 				}
 				if successful && lease.QuotaMode != "" {
 					if lease.QuotaMode != "weekly" {
-						units := max(1, response.QuotaUnits)
-						var updated bool
-						err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
-							var decrementErr error
-							updated, decrementErr = s.accounts.DecrementQuota(stageCtx, accountID, lease.QuotaMode, units)
-							return decrementErr
-						})
-						if err != nil {
-							s.logger.Warn("provider_quota_decrement_failed", "provider", credential.Provider, "account_id", accountID, "mode", lease.QuotaMode, "units", units, "error", err)
-						} else if updated {
-							s.selector.ConsumeQuota(credential.Provider, accountID, lease.QuotaMode, units)
+						// Console local windows are open/closed flags driven by upstream
+						// 429 exhaustion + timed recovery. Do not burn remaining on success.
+						if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind != provider.QuotaLocalWindow {
+							units := max(1, response.QuotaUnits)
+							var updated bool
+							err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
+								var decrementErr error
+								updated, decrementErr = s.accounts.DecrementQuota(stageCtx, accountID, lease.QuotaMode, units)
+								return decrementErr
+							})
+							if err != nil {
+								s.logger.Warn("provider_quota_decrement_failed", "provider", credential.Provider, "account_id", accountID, "mode", lease.QuotaMode, "units", units, "error", err)
+							} else if updated {
+								s.selector.ConsumeQuota(credential.Provider, accountID, lease.QuotaMode, units)
+							}
 						}
 					}
 				}

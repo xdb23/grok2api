@@ -25,6 +25,7 @@ import (
 
 func TestCatalogContainsAllConsoleModelsAndAliases(t *testing.T) {
 	expected := map[string]string{
+		"Console/grok-4.5":                     "grok-4.5",
 		"Console/grok-4.3":                     "grok-4.3",
 		"Console/grok-4.20-0309":               "grok-4.20-0309",
 		"Console/grok-4.20-0309-reasoning":     "grok-4.20-0309-reasoning",
@@ -45,16 +46,17 @@ func TestCatalogContainsAllConsoleModelsAndAliases(t *testing.T) {
 		}
 	}
 	aliases := Aliases()
-	if len(aliases) != 13 {
-		t.Fatalf("aliases = %d, want 13", len(aliases))
+	if len(aliases) != 17 {
+		t.Fatalf("aliases = %d, want 17", len(aliases))
 	}
 	registry := provider.NewRegistry(NewAdapter(Config{}, nil, nil))
 	if registry.SupportsStoredResponses(account.ProviderConsole) {
 		t.Fatal("console must not advertise stored Responses support")
 	}
 	for _, name := range []string{
-		"grok-4.3-console", "grok-4.20-0309-console", "grok-4.20-0309-reasoning-console",
+		"grok-4.5-console", "grok-4.3-console", "grok-4.20-0309-console", "grok-4.20-0309-reasoning-console",
 		"grok-4.20-0309-non-reasoning-console", "grok-4.20-multi-agent-console", "grok-build-console",
+		"grok-4.5-low", "grok-4.5-medium", "grok-4.5-high",
 		"grok-4.3-low", "grok-4.3-medium", "grok-4.3-high",
 		"grok-4.20-multi-agent-low", "grok-4.20-multi-agent-medium", "grok-4.20-multi-agent-high", "grok-4.20-multi-agent-xhigh",
 	} {

@@ -74,7 +74,7 @@ func (s *quotaStub) HasQuotaWindows(context.Context, uint64) (bool, error) {
 
 func (s *quotaStub) RefreshQuota(context.Context, uint64) ([]accountdomain.QuotaWindow, error) {
 	s.syncs++
-	return []accountdomain.QuotaWindow{{Mode: "console", Remaining: 20}}, nil
+	return []accountdomain.QuotaWindow{{Mode: "console", Remaining: 1}}, nil
 }
 
 func (s *billingStub) HasBillingSnapshot(context.Context, uint64) (bool, error) {

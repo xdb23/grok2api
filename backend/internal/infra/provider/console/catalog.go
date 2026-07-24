@@ -7,8 +7,12 @@ import (
 )
 
 const (
-	QuotaMode          = "console"
-	DefaultQuotaLimit  = 20
+	QuotaMode = "console"
+	// DefaultQuotaLimit is the healthy open remaining for Console local windows.
+	// Console no longer pre-counts successful requests against a fixed budget;
+	// remaining is only flipped to 0 when upstream rate-limits/exhausts the
+	// account, then restored after DefaultQuotaWindow seconds.
+	DefaultQuotaLimit  = 1
 	DefaultQuotaWindow = 3600
 )
 
@@ -22,6 +26,7 @@ type ModelSpec struct {
 }
 
 var catalog = []ModelSpec{
+	{PublicID: "grok-4.5", UpstreamModel: "grok-4.5", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309", UpstreamModel: "grok-4.20-0309", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", MaxOutputTokens: 1_000_000, SearchTools: true},
@@ -31,12 +36,16 @@ var catalog = []ModelSpec{
 }
 
 var aliases = []provider.ModelAlias{
+	consoleAlias("grok-4.5-console", "grok-4.5", "grok-4.5", ""),
 	consoleAlias("grok-4.3-console", "grok-4.3", "grok-4.3", ""),
 	consoleAlias("grok-4.20-0309-console", "grok-4.20-0309", "grok-4.20-0309", ""),
 	consoleAlias("grok-4.20-0309-reasoning-console", "grok-4.20-0309-reasoning", "grok-4.20-0309-reasoning", ""),
 	consoleAlias("grok-4.20-0309-non-reasoning-console", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-non-reasoning", ""),
 	consoleAlias("grok-4.20-multi-agent-console", "grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-0309", ""),
 	consoleAlias("grok-build-console", "grok-build-0.1", "grok-build-0.1", ""),
+	consoleAlias("grok-4.5-low", "grok-4.5", "grok-4.5", "low"),
+	consoleAlias("grok-4.5-medium", "grok-4.5", "grok-4.5", "medium"),
+	consoleAlias("grok-4.5-high", "grok-4.5", "grok-4.5", "high"),
 	consoleAlias("grok-4.3-low", "grok-4.3", "grok-4.3", "low"),
 	consoleAlias("grok-4.3-medium", "grok-4.3", "grok-4.3", "medium"),
 	consoleAlias("grok-4.3-high", "grok-4.3", "grok-4.3", "high"),
