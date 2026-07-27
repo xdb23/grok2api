@@ -112,46 +112,46 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 	if _, err := s.ReconcileCredentialSchedules(ctx); err != nil {
 		return err
 	}
-	for {
-		ids, err := s.accounts.ListDueCredentialRefreshIDs(ctx, s.now(), credentialRefreshBatchSize)
+	// One batch per wake: large pools can have thousands due at once (e.g. after a
+	// restart or import). Draining them in a tight loop saturates CPU/egress for
+	// minutes and starves inference. Remaining due rows stay indexed and the
+	// scheduler wakes again shortly (see nextCredentialRefreshDelay backlog floor).
+	ids, err := s.accounts.ListDueCredentialRefreshIDs(ctx, s.now(), credentialRefreshBatchSize)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	_, failed, batchErr := s.runAccountBatch(ctx, "credential_auto_refresh", ids, s.refreshPool, nil, func(workCtx context.Context, id uint64) error {
+		taskCtx, cancel := context.WithTimeout(workCtx, credentialRefreshTimeout)
+		defer cancel()
+		credential, err := s.accounts.Get(taskCtx, id)
 		if err != nil {
 			return err
 		}
-		if len(ids) == 0 {
+		if !credential.Enabled || credential.AuthStatus != accountdomain.AuthStatusActive || s.providers == nil || !s.providers.SupportsCredentialRefresh(credential.Provider) || credential.EncryptedRefreshToken == "" {
 			return nil
 		}
-		_, failed, batchErr := s.runAccountBatch(ctx, "credential_auto_refresh", ids, s.refreshPool, nil, func(workCtx context.Context, id uint64) error {
-			taskCtx, cancel := context.WithTimeout(workCtx, credentialRefreshTimeout)
-			defer cancel()
-			credential, err := s.accounts.Get(taskCtx, id)
-			if err != nil {
-				return err
-			}
-			if !credential.Enabled || credential.AuthStatus != accountdomain.AuthStatusActive || s.providers == nil || !s.providers.SupportsCredentialRefresh(credential.Provider) || credential.EncryptedRefreshToken == "" {
+		if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
+			if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
 				return nil
 			}
-			if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
-				if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
-					return nil
-				}
-				return s.MarkReauthRequired(taskCtx, id, permanentRefreshExpiredReason)
-			}
-			if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(s.now()) {
-				return nil
-			}
-			_, err = s.ensureCredential(taskCtx, credential, true, false, true)
-			return err
-		})
-		if batchErr != nil {
-			return fmt.Errorf("自动刷新批次执行失败: %w", batchErr)
+			return s.MarkReauthRequired(taskCtx, id, permanentRefreshExpiredReason)
 		}
-		if failed > 0 {
-			return fmt.Errorf("自动刷新批次失败 %d/%d", failed, len(ids))
-		}
-		if len(ids) < credentialRefreshBatchSize {
+		if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(s.now()) {
 			return nil
 		}
+		_, err = s.ensureCredential(taskCtx, credential, true, false, true)
+		return err
+	})
+	if batchErr != nil {
+		return fmt.Errorf("自动刷新批次执行失败: %w", batchErr)
 	}
+	if failed > 0 {
+		return fmt.Errorf("自动刷新批次失败 %d/%d", failed, len(ids))
+	}
+	return nil
 }
 
 func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration, error) {
@@ -166,8 +166,15 @@ func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration
 			delay = until
 		}
 	}
+	// Backlog floor: when thousands are already due, do not spin every 100ms.
+	// Request-path EnsureCredential still refreshes hot accounts within 3 minutes
+	// of expiry, so background can pace without user-visible 401s.
+	const backlogMinDelay = 5 * time.Second
 	if delay < 100*time.Millisecond {
 		delay = 100 * time.Millisecond
+	}
+	if next != nil && !next.After(s.now()) && delay < backlogMinDelay {
+		delay = backlogMinDelay
 	}
 	return delay, nil
 }

@@ -226,6 +226,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				}
 				return invalidResponsesResponse(err), nil
 			}
+			// Body prompt_cache_key MUST equal header x-grok-conv-id (CPA dual-write).
+			// Normalize once via grokSessionID so non-UUID seeds never diverge between body and headers.
 			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
 			if err != nil {
 				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
@@ -801,8 +803,13 @@ func grokSessionID(promptCacheKey string) (string, error) {
 }
 
 func injectPromptCacheKey(body []byte, clientKey string) ([]byte, error) {
-	key := strings.TrimSpace(clientKey)
-	if key == "" {
+	// Normalize with the same function used for x-grok-conv-id / x-grok-session-id.
+	// Mismatched body key vs conv-id header is a common cause of zero multi-turn cache hits.
+	sessionID, err := grokSessionID(clientKey)
+	if err != nil {
+		return nil, err
+	}
+	if sessionID == "" {
 		return body, nil
 	}
 	var payload map[string]json.RawMessage
@@ -812,7 +819,7 @@ func injectPromptCacheKey(body []byte, clientKey string) ([]byte, error) {
 	if payload == nil {
 		payload = make(map[string]json.RawMessage)
 	}
-	payload["prompt_cache_key"] = mustJSON(key)
+	payload["prompt_cache_key"] = mustJSON(sessionID)
 	return json.Marshal(payload)
 }
 

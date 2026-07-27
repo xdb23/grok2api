@@ -12,6 +12,7 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	auditdomain "github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
@@ -43,12 +44,20 @@ const (
 	freeUsageWindow              time.Duration = 24 * time.Hour
 	forcedRefreshMinInterval     time.Duration = 30 * time.Second
 	paidProbeRetryInterval       time.Duration = 15 * time.Minute
-	credentialRefreshAdvance     time.Duration = 3 * time.Minute
-	credentialRefreshSafetyPoll  time.Duration = time.Minute
-	credentialRefreshTimeout     time.Duration = 30 * time.Second
-	credentialRefreshStateTTL    time.Duration = 5 * time.Second
-	credentialStateWriteTimeout  time.Duration = 5 * time.Second
-	credentialRefreshBatchSize                 = 100
+	// Background / scheduler proactive window: refresh before absolute expiry.
+	credentialRefreshAdvance time.Duration = 3 * time.Minute
+	// Request hot path only blocks when the access token is already expired or
+	// expires within this skew. Tokens still valid beyond the skew are returned
+	// immediately; proactive refresh is nudged onto the background scheduler so
+	// inference does not convoy behind OAuth (credential_wait p95 spikes).
+	hotPathCredentialSkew       time.Duration = 15 * time.Second
+	credentialRefreshSafetyPoll time.Duration = time.Minute
+	credentialRefreshTimeout    time.Duration = 30 * time.Second
+	credentialRefreshStateTTL   time.Duration = 5 * time.Second
+	credentialStateWriteTimeout time.Duration = 5 * time.Second
+	// Keep batches modest so background OAuth does not monopolize a core for minutes
+	// when tens of thousands of tokens share similar expiry (import/restart backlog).
+	credentialRefreshBatchSize = 25
 	managedTaskWorkerCeiling                   = 50
 	webQuotaRefreshQueueSize                   = 4096
 	webQuotaRefreshTimeout                     = 30 * time.Second
@@ -61,6 +70,8 @@ const (
 	maxCredentialExportAccounts                = 10000
 	maxCredentialImportAccounts                = 10000
 	credentialImportChunkSize                  = 100
+	maxQuotaResetAccounts                      = 10000
+	quotaResetChunkSize                        = 500
 	maxBuildConversionAccounts                 = 1000
 	maxWebConsoleSyncAccounts                  = 1000
 	accountTaskBatchSize                       = 1000
@@ -141,6 +152,8 @@ type View struct {
 	Quota           QuotaView
 	QuotaWindows    []accountdomain.QuotaWindow
 	BuildBotFlagged bool
+	// RequestStats is lifetime + today (UTC day) success/failure counts for this account.
+	RequestStats *auditdomain.AccountRequestStats
 }
 
 type UpdateInput struct {
@@ -412,16 +425,16 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	page, pageSize = normalizePage(page, pageSize)
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
-		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!oneOf(filter.Status, "", "active", "abnormal", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
 		!oneOf(filter.Egress, "", "bound", "unbound") ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
 		(filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) ||
 		!oneOf(filter.Agreement, "", "nsfwEnabled", "nsfwDisabled", "termsAccepted", "termsNotAccepted", "allAccepted", "allNotAccepted") ||
 		(filter.Agreement != "" && filter.Provider != string(accountdomain.ProviderWeb)) ||
-		!oneOf(filter.Association, "", "buildLinked", "buildUnlinked", "consoleLinked", "consoleUnlinked", "allLinked", "allUnlinked") ||
+		!oneOf(filter.Association, "", "buildLinked", "buildUnlinked", "consoleLinked", "consoleUnlinked", "allLinked", "allUnlinked", "buildConvertBlocked", "buildConvertAllowed") ||
 		(filter.Association != "" && filter.Provider != string(accountdomain.ProviderWeb)) ||
-		!repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
+		!repository.IsValidSort(filter.Sort, "name", "type", "status", "quota", "lastUsedAt", "createdAt") {
 		return nil, 0, ErrInvalidFilter
 	}
 	var refreshable *bool
@@ -472,6 +485,13 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if err != nil {
 		return nil, 0, err
 	}
+	var requestStats map[uint64]auditdomain.AccountRequestStats
+	if s.audits != nil {
+		requestStats, err = s.audits.AccountRequestStats(ctx, accountIDs)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
 	views := make([]View, 0, len(values))
 	for _, value := range values {
 		metadata := s.credentialMetadata(value)
@@ -485,6 +505,10 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		}
 		view.Quota = newQuotaView(view.Billing, observedTokens[value.ID], recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
 		view.QuotaWindows = quotaWindows[value.ID]
+		if stats, ok := requestStats[value.ID]; ok {
+			copy := stats
+			view.RequestStats = &copy
+		}
 		views = append(views, view)
 	}
 	return views, total, nil
@@ -1185,6 +1209,18 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 		if err != nil {
 			return ImportResult{}, fmt.Errorf("解密 Grok Web SSO: %w", err)
 		}
+		// Same JWT rule as import: refuse to clone JSON garbage / plain-text mistakes into Console.
+		token = provider.SanitizeSSOToken(token)
+		if err := provider.ValidateSSOToken(token); err != nil {
+			label := strings.TrimSpace(value.Email)
+			if label == "" {
+				label = strings.TrimSpace(value.Name)
+			}
+			if label == "" {
+				label = fmt.Sprintf("id=%d", value.ID)
+			}
+			return ImportResult{}, fmt.Errorf("Web 账号 %s 的 SSO 不是有效 JWT，拒绝同步到 Console: %w（请按规范重新导入 eyJ... 会话）", label, err)
+		}
 		parsed, err := adapter.ParseImportedCredentials([]byte(token))
 		if err != nil {
 			return ImportResult{}, fmt.Errorf("生成 Grok Console SSO 凭据: %w", err)
@@ -1221,19 +1257,19 @@ func webConsoleAccountName(webName, fallback string) string {
 
 // ConvertWebAccountsToBuild 使用 Web SSO 自动完成 xAI Device Flow，并建立唯一的 Web/Build 账号关联。
 func (s *Service) ConvertWebAccountsToBuild(ctx context.Context, ids []uint64) (BuildConversionResult, error) {
-	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, nil, nil)
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, false, nil, nil)
 }
 
 func (s *Service) ConvertWebAccountsToBuildWithObserver(ctx context.Context, ids []uint64, observer ImportedAccountObserver) (BuildConversionResult, error) {
-	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, observer, nil)
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, false, observer, nil)
 }
 
 // ConvertWebAccountsToBuildWithProgress 转换指定账号，并向调用方报告真实完成数。
 func (s *Service) ConvertWebAccountsToBuildWithProgress(ctx context.Context, ids []uint64, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
-	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, observer, progress)
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, false, observer, progress)
 }
 
-func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, force bool, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
 	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
 		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
 	}
@@ -1243,33 +1279,33 @@ func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids
 	}
 	prefilteredSkipped := 0
 	if strategy == BuildConversionMissing {
-		candidates, err := s.accounts.FilterMissingBuildConversionIDs(ctx, ids)
+		candidates, err := s.accounts.FilterMissingBuildConversionIDs(ctx, ids, force)
 		if err != nil {
 			return BuildConversionResult{}, mapRepositoryError(err)
 		}
 		prefilteredSkipped = len(ids) - len(candidates)
 		ids = candidates
 	}
-	result, err := s.convertWebAccountsToBuild(ctx, ids, strategy, observer, progress)
+	result, err := s.convertWebAccountsToBuild(ctx, ids, strategy, force, observer, progress)
 	result.Skipped += prefilteredSkipped
 	return result, err
 }
 
 // ConvertAllWebAccountsToBuild 转换全部尚未建立 Build 关联的 Grok Web 账号。
 func (s *Service) ConvertAllWebAccountsToBuild(ctx context.Context) (BuildConversionResult, error) {
-	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, nil, nil)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, false, nil, nil)
 }
 
 func (s *Service) ConvertAllWebAccountsToBuildWithObserver(ctx context.Context, observer ImportedAccountObserver) (BuildConversionResult, error) {
-	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, observer, nil)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, false, observer, nil)
 }
 
 // ConvertAllWebAccountsToBuildWithProgress 转换完整未关联号池，并向调用方报告真实完成数。
 func (s *Service) ConvertAllWebAccountsToBuildWithProgress(ctx context.Context, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
-	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, observer, progress)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, false, observer, progress)
 }
 
-func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, strategy BuildConversionStrategy, force bool, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
 	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
 		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
 	}
@@ -1292,17 +1328,29 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 	initialized := false
 	for {
 		var (
-			ids   []uint64
-			count int64
-			err   error
+			ids      []uint64
+			count    int64
+			err      error
+			scanLast uint64
+			scanN    int
 		)
 		if strategy == BuildConversionMissing {
-			ids, count, err = s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batchSize)
+			ids, count, err = s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batchSize, force)
+			scanN = len(ids)
+			if scanN > 0 {
+				scanLast = ids[scanN-1]
+			}
 		} else {
 			var values []accountdomain.Credential
 			values, count, err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
+			scanN = len(values)
 			ids = make([]uint64, 0, len(values))
 			for _, value := range values {
+				scanLast = value.ID
+				if !force && value.BuildConvertBlockedAt != nil {
+					result.Skipped++
+					continue
+				}
 				ids = append(ids, value.ID)
 			}
 		}
@@ -1318,27 +1366,29 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 				}
 			}
 		}
-		if len(ids) == 0 {
+		if scanN == 0 {
 			return result, nil
 		}
-		current, err := s.convertWebAccountsToBuild(ctx, ids, strategy, batchObserver, offsetBatchProgress(progress, completed, total))
-		result.Created += current.Created
-		result.Linked += current.Linked
-		result.Skipped += current.Skipped
-		result.Failed += current.Failed
-		for _, buildID := range current.BuildAccountIDs {
-			if _, exists := seenBuildIDs[buildID]; exists {
-				continue
+		if len(ids) > 0 {
+			current, convertErr := s.convertWebAccountsToBuild(ctx, ids, strategy, force, batchObserver, offsetBatchProgress(progress, completed, total))
+			result.Created += current.Created
+			result.Linked += current.Linked
+			result.Skipped += current.Skipped
+			result.Failed += current.Failed
+			for _, buildID := range current.BuildAccountIDs {
+				if _, exists := seenBuildIDs[buildID]; exists {
+					continue
+				}
+				seenBuildIDs[buildID] = struct{}{}
+				result.BuildAccountIDs = append(result.BuildAccountIDs, buildID)
 			}
-			seenBuildIDs[buildID] = struct{}{}
-			result.BuildAccountIDs = append(result.BuildAccountIDs, buildID)
+			if convertErr != nil {
+				return result, convertErr
+			}
 		}
-		if err != nil {
-			return result, err
-		}
-		completed += len(ids)
-		afterID = ids[len(ids)-1]
-		if len(ids) < batchSize {
+		completed += scanN
+		afterID = scanLast
+		if scanN < batchSize {
 			return result, nil
 		}
 	}
@@ -1356,7 +1406,7 @@ func offsetBatchProgress(progress BatchProgressObserver, offset, total int) Batc
 	}
 }
 
-func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, force bool, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
 	if progress != nil {
 		if err := progress(0, len(ids)); err != nil {
 			return BuildConversionResult{}, err
@@ -1376,7 +1426,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results, summary, runErr := batch.MapObserved(runCtx, ids, batch.Options{Workers: s.conversionPool.Limit(), Pool: s.conversionPool}, func(workCtx context.Context, id uint64) (outcome, error) {
-		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id, strategy)
+		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id, strategy, force)
 		return outcome{accountID: id, buildID: buildID, created: created, skipped: skipped, err: convertErr}, nil
 	}, func(_ int, execution batch.Result[outcome]) {
 		observerMu.Lock()
@@ -1441,7 +1491,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	return result, nil
 }
 
-func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strategy BuildConversionStrategy) (uint64, bool, bool, error) {
+func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strategy BuildConversionStrategy, force bool) (uint64, bool, bool, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
 		return 0, false, false, mapRepositoryError(err)
@@ -1451,6 +1501,10 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	}
 	if value.LinkedAccountID != 0 && strategy == BuildConversionMissing {
 		return value.LinkedAccountID, false, true, nil
+	}
+	// Default auto convert skips accounts permanently blocked by invalid_grant.
+	if !force && value.BuildConvertBlockedAt != nil {
+		return 0, false, true, nil
 	}
 	release, acquired, err := s.refreshLock.Acquire(ctx, "web-build-conversion:"+strconv.FormatUint(id, 10), 2*time.Minute)
 	if err != nil {
@@ -1466,6 +1520,9 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	}
 	if value.LinkedAccountID != 0 && strategy == BuildConversionMissing {
 		return value.LinkedAccountID, false, true, nil
+	}
+	if !force && value.BuildConvertBlockedAt != nil {
+		return 0, false, true, nil
 	}
 	linkedBuildSourceKey := ""
 	if value.LinkedAccountID != 0 {
@@ -1487,6 +1544,13 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 		if errors.Is(err, provider.ErrUnauthorized) {
 			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, "Grok Web SSO credential rejected"))
 		}
+		if isBuildConvertInvalidGrant(err) {
+			if markErr := s.accounts.MarkWebBuildConvertBlocked(ctx, id, "invalid_grant", s.now()); markErr != nil {
+				s.logger.Warn("web_account_build_convert_block_failed", "account_id", id, "error", markErr)
+			} else {
+				s.logger.Info("web_account_build_convert_blocked", "account_id", id, "reason", "invalid_grant")
+			}
+		}
 		return 0, false, false, err
 	}
 	seed.Provider = accountdomain.ProviderBuild
@@ -1504,7 +1568,22 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	if err := s.accounts.LinkWebToBuild(ctx, id, buildAccount.ID); err != nil {
 		return 0, false, false, mapRepositoryError(err)
 	}
+	if value.BuildConvertBlockedAt != nil {
+		if clearErr := s.accounts.ClearWebBuildConvertBlocked(ctx, id); clearErr != nil {
+			s.logger.Warn("web_account_build_convert_unblock_failed", "account_id", id, "error", clearErr)
+		}
+	}
 	return buildAccount.ID, created, false, nil
+}
+
+func isBuildConvertInvalidGrant(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, provider.ErrInvalidGrant) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "invalid_grant")
 }
 
 // ExportCredentials 保留 Grok Build 默认导出语义，供旧调用方兼容。
@@ -1708,11 +1787,45 @@ func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdo
 }
 
 // EnsureCredential 在即将过期时刷新 token，同一账号并发请求只执行一次刷新。
+// 请求热路径（force=false）对仍可用的 access token 不阻塞 OAuth：仅在 token
+// 缺失或已过期/即将过期（hotPathCredentialSkew）时同步刷新；提前量窗口内的
+// 主动刷新交给后台 scheduler，避免 inference 被 credential_wait 拖成数秒尾延迟。
 func (s *Service) EnsureCredential(ctx context.Context, value accountdomain.Credential, force bool) (accountdomain.Credential, error) {
 	return s.ensureCredential(ctx, value, force, false, false)
 }
 
+// credentialUsableOnHotPath reports whether the access token can be used without a
+// synchronous refresh. nudge=true means the token is inside the proactive advance
+// window and the background scheduler should run soon.
+func credentialUsableOnHotPath(value accountdomain.Credential, now time.Time) (usable bool, nudge bool) {
+	if strings.TrimSpace(value.EncryptedAccessToken) == "" {
+		return false, false
+	}
+	if value.ExpiresAt.IsZero() {
+		return true, false
+	}
+	// Still valid beyond the hot-path skew → usable on the request path.
+	if now.Add(hotPathCredentialSkew).Before(value.ExpiresAt) {
+		// Inside advance window → ask scheduler to refresh before absolute expiry.
+		if !now.Add(credentialRefreshAdvance).Before(value.ExpiresAt) {
+			return true, true
+		}
+		return true, false
+	}
+	return false, false
+}
+
 func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Credential, force, bypassCooldown, respectSchedule bool) (accountdomain.Credential, error) {
+	// Selection/routing caches may omit encrypted token material so large pools do
+	// not re-scan secrets on every request. Always rebind the latest credential row
+	// here (single primary-key read) before deciding whether a refresh is needed.
+	if value.ID != 0 && s.accounts != nil {
+		latest, err := s.accounts.Get(ctx, value.ID)
+		if err != nil {
+			return accountdomain.Credential{}, err
+		}
+		value = latest
+	}
 	if s.providers == nil || !s.providers.SupportsCredentialRefresh(value.Provider) {
 		if force {
 			return accountdomain.Credential{}, ErrUnsupported
@@ -1722,6 +1835,16 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 	now := s.now()
 	if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, value, now, force); handled {
 		return credential, err
+	}
+	// Hot path (force=false, not scheduled): never block on proactive refresh.
+	// Only sync-refresh when the access token is missing or effectively expired.
+	if !force && !respectSchedule {
+		if usable, nudge := credentialUsableOnHotPath(value, now); usable {
+			if nudge {
+				s.WakeCredentialRefresh()
+			}
+			return value, nil
+		}
 	}
 	if !force && value.ExpiresAt.IsZero() && value.EncryptedAccessToken != "" {
 		return value, nil
@@ -1750,6 +1873,13 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		}
 		if force && latest.EncryptedAccessToken != "" && latest.EncryptedAccessToken != value.EncryptedAccessToken {
 			return latest, nil
+		}
+		// Inside singleflight: hot-path waiters that raced into Do can still exit
+		// without performing OAuth when a usable token is already on the row.
+		if !force && !respectSchedule {
+			if usable, _ := credentialUsableOnHotPath(latest, currentTime); usable {
+				return latest, nil
+			}
 		}
 		if !force && latest.EncryptedAccessToken != "" && !latest.ExpiresAt.IsZero() && currentTime.Add(credentialRefreshAdvance).Before(latest.ExpiresAt) {
 			return latest, nil
@@ -1782,6 +1912,11 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 			}
 			if latest.EncryptedAccessToken != "" && latest.EncryptedAccessToken != value.EncryptedAccessToken {
 				return latest, nil
+			}
+			if !force && !respectSchedule {
+				if usable, _ := credentialUsableOnHotPath(latest, currentTime); usable {
+					return latest, nil
+				}
 			}
 			if !force && latest.EncryptedAccessToken != "" && !latest.ExpiresAt.IsZero() && currentTime.Add(credentialRefreshAdvance).Before(latest.ExpiresAt) {
 				return latest, nil
@@ -2789,6 +2924,42 @@ func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, i
 		return 0, 0, err
 	}
 	return s.refreshBillings(ctx, values, nil)
+}
+
+// BatchResetQuotaState clears local Build free/model quota recovery without changing
+// upstream billing snapshots (official v3.0.9 #778).
+func (s *Service) BatchResetQuotaState(ctx context.Context, ids []uint64) (int, error) {
+	values, err := normalizeIDs(ids, maxQuotaResetAccounts)
+	if err != nil {
+		return 0, err
+	}
+	for start := 0; start < len(values); start += quotaResetChunkSize {
+		end := min(start+quotaResetChunkSize, len(values))
+		count, countErr := s.accounts.CountProviderAccountsByIDs(ctx, accountdomain.ProviderBuild, values[start:end])
+		if countErr != nil {
+			return 0, countErr
+		}
+		if count != int64(end-start) {
+			return 0, invalidInput("仅 Grok Build 账号支持手动重置额度状态")
+		}
+	}
+	reset := 0
+	for start := 0; start < len(values); start += quotaResetChunkSize {
+		if err := ctx.Err(); err != nil {
+			return reset, err
+		}
+		end := min(start+quotaResetChunkSize, len(values))
+		if err := s.accounts.ResetQuotaState(ctx, accountdomain.ProviderBuild, values[start:end]); err != nil {
+			return reset, err
+		}
+		reset += end - start
+	}
+	return reset, nil
+}
+
+// ResetAllBuildQuotaState clears local quota recovery for every enabled Build account.
+func (s *Service) ResetAllBuildQuotaState(ctx context.Context) (int64, error) {
+	return s.accounts.ResetProviderQuotaState(ctx, accountdomain.ProviderBuild, true)
 }
 
 // BatchRefreshQuota 使用有限并发同步选中 Web 或 Console 账号的额度窗口。

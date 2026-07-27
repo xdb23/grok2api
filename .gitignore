@@ -12,6 +12,7 @@ Thumbs.db
 .env.*
 !.env.example
 /config.yaml
+/config.dev.yaml
 /config.local.yaml
 /config.*.local.yaml
 /docs/*
@@ -24,7 +25,9 @@ Thumbs.db
 # Runtime data
 /data/
 /backend/data/
+/tmp/
 *.log
+build-errors.log
 
 # Go
 /.gocache/
@@ -45,3 +48,11 @@ Thumbs.db
 /release/
 /.tmp/
 /tmp/
+
+# Local SQLite / backups (never commit)
+/backend.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.bak
+*.bak-*

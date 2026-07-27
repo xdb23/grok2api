@@ -332,6 +332,63 @@ func (a *Application) reconcileStartup(ctx context.Context) {
 	a.logger.Info("startup_reconciliation_completed", "credentials_backfilled", report.SchedulesBackfilled, "critical_found", report.CriticalFound, "credentials_refreshed", report.Refreshed, "credentials_failed", report.Failed)
 }
 
+func (a *Application) runSelectorPrewarm(ctx context.Context) {
+	// One-shot warm, then park until shutdown. Returning would make runSupervisedTask
+	// treat it as a crash and re-scan the whole pool every 30s (major CPU waste).
+	defer func() { <-ctx.Done() }()
+	if a == nil || a.gateway == nil || a.modelRepo == nil || a.providers == nil {
+		return
+	}
+	routes, err := a.modelRepo.ListConfiguredEnabled(ctx)
+	if err != nil {
+		a.logger.Warn("selector_prewarm_list_routes_failed", "error", err)
+		return
+	}
+	// Cap prewarm work: prioritize Build/Web routes (largest pool / hottest path).
+	type prewarmRoute struct {
+		Provider      accountdomain.Provider
+		UpstreamModel string
+		QuotaMode     string
+	}
+	seen := make(map[string]bool, 16)
+	targets := make([]prewarmRoute, 0, 8)
+	for _, route := range routes {
+		if route.Provider != accountdomain.ProviderBuild && route.Provider != accountdomain.ProviderWeb {
+			continue
+		}
+		quotaMode := a.providers.QuotaMode(route.Provider, route.UpstreamModel)
+		key := string(route.Provider) + "\x00" + route.UpstreamModel + "\x00" + quotaMode
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		targets = append(targets, prewarmRoute{
+			Provider: route.Provider, UpstreamModel: route.UpstreamModel, QuotaMode: quotaMode,
+		})
+		if len(targets) >= 8 {
+			break
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	started := time.Now()
+	payload := make([]struct {
+		Provider      accountdomain.Provider
+		UpstreamModel string
+		QuotaMode     string
+	}, len(targets))
+	for i, value := range targets {
+		payload[i] = struct {
+			Provider      accountdomain.Provider
+			UpstreamModel string
+			QuotaMode     string
+		}{Provider: value.Provider, UpstreamModel: value.UpstreamModel, QuotaMode: value.QuotaMode}
+	}
+	a.gateway.PrewarmSelector(ctx, payload)
+	a.logger.Info("selector_prewarm_completed", "routes", len(targets), "duration_ms", time.Since(started).Milliseconds())
+}
+
 func (a *Application) runStatsigWarmup(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()

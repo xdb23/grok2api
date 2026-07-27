@@ -40,7 +40,7 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	}
 
 	accounts := relational.NewAccountRepository(database)
-	token := "shared-sso-token"
+	token := "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzaGFyZWQtc3NvLXRva2VuIn0.sigsharedvalue"
 	cloudflareCookie := "cf_clearance=shared-clearance; __cf_bm=shared-bm"
 	webAccount, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
 		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
@@ -108,7 +108,7 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	if second.Created != 0 || second.Updated != 1 || len(second.AccountIDs) != 1 || second.AccountIDs[0] != consoleAccount.ID {
 		t.Fatalf("second sync = %#v", second)
 	}
-	secondToken := "missing-sso-token"
+	secondToken := "eyJhbGciOiJub25lIn0.eyJzdWIiOiJtaXNzaW5nLXNzbyJ9.sigmissingvalue"
 	missingWeb, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
 		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
 		Name: "Grok Web missing", SourceKey: "sso:" + security.HashToken(secondToken),
@@ -167,7 +167,7 @@ func TestSyncAllWebAccountsToConsoleProcessesMoreThanLegacyLimitInBatches(t *tes
 	}
 	values := make([]accountdomain.Credential, 0, totalAccounts)
 	for index := 1; index <= totalAccounts; index++ {
-		token := fmt.Sprintf("sso-token-%d", index)
+		token := fmt.Sprintf("eyJhbGciOiJub25lIn0.eyJzdWIiOiJhY2NvdW50LSVkIn0.sigbatch%08dxx", index)
 		encrypted, encryptErr := cipher.Encrypt(token)
 		if encryptErr != nil {
 			t.Fatal(encryptErr)

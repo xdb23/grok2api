@@ -32,6 +32,22 @@ func (g *ConcurrencyGate) UpdateLimit(limit int) {
 	g.mu.Unlock()
 }
 
+// Snapshot returns current in-flight count and configured limit for load shedding.
+func (g *ConcurrencyGate) Snapshot() (active, limit int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.active, g.limit
+}
+
+// Load returns active/limit in [0,1+]. Values near or above 1 mean the gate is saturated.
+func (g *ConcurrencyGate) Load() float64 {
+	active, limit := g.Snapshot()
+	if limit < 1 {
+		return 0
+	}
+	return float64(active) / float64(limit)
+}
+
 // Middleware 返回绑定当前 Gate 状态的 Gin 中间件。
 func (g *ConcurrencyGate) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {

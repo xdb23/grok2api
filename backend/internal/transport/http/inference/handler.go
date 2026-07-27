@@ -43,7 +43,11 @@ const (
 	maxJSONResponseTransferBytes    = 128 << 20
 	maxStreamResponseTransferBytes  = 256 << 20
 	maxMediaResponseTransferBytes   = int64(2) << 30
-	responseWriteTimeout            = 30 * time.Second
+	// Reasoning models routinely idle >30s between SSE chunks while thinking.
+	// A short write deadline aborts an already-flushed HTTP 200 stream and
+	// surfaces to clients as "empty or malformed response (HTTP 200)".
+	// Match long-lived proxy idle budgets (CPA/nginx-style) rather than TTFT.
+	responseWriteTimeout = 15 * time.Minute
 )
 
 var (
@@ -84,6 +88,9 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/responses", h.createResponse)
 	router.POST("/chat/completions", h.createChatCompletion)
 	router.POST("/messages", h.createMessage)
+	// Claude Code / SDK token probes — must not 404 as plain text.
+	router.POST("/responses/input_tokens", h.countResponseInputTokens)
+	router.POST("/messages/count_tokens", h.countMessageTokens)
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
 	router.POST("/videos/generations", h.generateVideo)
@@ -289,6 +296,89 @@ func (h *Handler) createMessage(c *gin.Context) {
 		return
 	}
 	h.writeAnthropicResult(c, result, request.Stream)
+}
+
+
+// countResponseInputTokens satisfies Claude Code / Responses SDK probes that hit
+// POST /v1/responses/input_tokens. G2A does not run a full tokenizer; return a
+// stable estimate so clients do not treat a Gin 404 plain-text page as success/failure noise.
+func (h *Handler) countResponseInputTokens(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
+	if !isJSONRequest(c) {
+		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "input_tokens only supports application/json")
+		return
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
+		return
+	}
+	if _, exists := c.Get(middleware.ClientKey); !exists {
+		writeOpenAIError(c, http.StatusUnauthorized, "invalid_api_key", "客户端 API Key 无效")
+		return
+	}
+	inputTokens := estimatePromptTokens(body)
+	c.JSON(http.StatusOK, gin.H{
+		"object":       "response.input_tokens",
+		"input_tokens": inputTokens,
+		"model":        extractJSONStringField(body, "model"),
+	})
+}
+
+// countMessageTokens satisfies Anthropic Messages count_tokens probes.
+func (h *Handler) countMessageTokens(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
+	if !isJSONRequest(c) {
+		writeAnthropicError(c, http.StatusUnsupportedMediaType, "invalid_request_error", "count_tokens only supports application/json")
+		return
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		writeAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds the configured limit")
+		return
+	}
+	if _, exists := c.Get(middleware.ClientKey); !exists {
+		writeAnthropicError(c, http.StatusUnauthorized, "authentication_error", "invalid API key")
+		return
+	}
+	inputTokens := estimatePromptTokens(body)
+	c.JSON(http.StatusOK, gin.H{
+		"input_tokens": inputTokens,
+	})
+}
+
+func extractJSONStringField(body []byte, field string) string {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	raw, ok := payload[field]
+	if !ok {
+		return ""
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+// estimatePromptTokens is a CPA-style cheap estimator (not a real tokenizer):
+// ~4 bytes per token for mixed JSON/tool payloads, with a small floor.
+func estimatePromptTokens(body []byte) int {
+	n := len(bytes.TrimSpace(body))
+	if n <= 0 {
+		return 1
+	}
+	tokens := (n + 3) / 4
+	if tokens < 1 {
+		tokens = 1
+	}
+	// Cap absurd probes so billing UIs stay sane.
+	if tokens > 2_000_000 {
+		tokens = 2_000_000
+	}
+	return tokens
 }
 
 func (h *Handler) generateImage(c *gin.Context) {
@@ -933,36 +1023,125 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		writeOpenAIError(c, http.StatusBadGateway, "response_too_large", "上游响应超过代理安全上限")
 		return
 	}
+	// Stream requests that fail before a real SSE body must not be proxied as
+	// "text/event-stream + JSON 400 + incomplete". Downstream relays (sub2api /
+	// Codex / Claude Code) then report empty-or-malformed under HTTP 200.
+	// CPA returns a structured application error for these cases.
+	if stream && result.StatusCode >= 400 {
+		errorCode = "upstream_error"
+		writeUpstreamStreamBootstrapError(c, result.StatusCode, result.Body, protocol, anthropic)
+		return
+	}
 	copyHeaders(c.Writer.Header(), result.Header)
-	c.Status(result.StatusCode)
 	if result.StatusCode >= 400 {
 		errorCode = "upstream_error"
 	}
 	var err error
 	if stream {
-		metadata, copyErr := copyStream(c.Writer, result.Body, protocol)
+		// Defer WriteHeader until the first upstream body byte (or a terminal
+		// failure). CPA-style clients treat "HTTP 200 + empty/truncated SSE"
+		// as a hard parse error; flushing 200 before any event made incomplete
+		// upstream streams look like a proxy intercept. TTFT still flushes on
+		// the first chunk below.
+		if c.Writer.Header().Get("Content-Type") == "" {
+			c.Header("Content-Type", "text/event-stream")
+		}
+		metadata, transferred, copyErr := copyStreamLazyStatus(c, result.Body, protocol, result.StatusCode, anthropic)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
+		if err != nil {
+			switch {
+			case errors.Is(err, errResponseTransferLimit):
+				errorCode = "response_too_large"
+			case errors.Is(err, errUpstreamStreamFailed):
+				errorCode = "upstream_stream_error"
+			case errors.Is(err, errUpstreamStreamIncomplete):
+				errorCode = "upstream_stream_incomplete"
+			case errors.Is(err, errUpstreamStreamRead):
+				errorCode = "upstream_stream_interrupted"
+			default:
+				errorCode = "stream_interrupted"
+			}
+			// Bootstrap path already wrote a JSON error via copyStreamLazyStatus.
+			// Mid-stream path injects an SSE error event so clients do not see a
+			// silent HTTP 200 hang-up (the "empty or malformed response" class).
+			_ = transferred
+		}
 	} else {
+		c.Status(result.StatusCode)
 		metadata, copyErr := copyJSON(c.Writer, result.Body, protocol)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
-	}
-	if err != nil {
-		switch {
-		case errors.Is(err, errResponseTransferLimit):
-			errorCode = "response_too_large"
-		case errors.Is(err, errUpstreamStreamFailed):
-			errorCode = "upstream_stream_error"
-		case errors.Is(err, errUpstreamStreamIncomplete):
-			errorCode = "upstream_stream_incomplete"
-		case errors.Is(err, errUpstreamStreamRead):
-			errorCode = "upstream_stream_interrupted"
-		default:
-			errorCode = "stream_interrupted"
+		if err != nil {
+			switch {
+			case errors.Is(err, errResponseTransferLimit):
+				errorCode = "response_too_large"
+			default:
+				errorCode = "stream_interrupted"
+			}
 		}
 	}
+}
+
+// writeUpstreamStreamBootstrapError turns a non-2xx upstream body into a normal
+// protocol error response for stream requests that never opened a valid SSE.
+func writeUpstreamStreamBootstrapError(c *gin.Context, status int, body io.Reader, protocol streamProtocol, anthropic bool) {
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxCredentialErrorInspectBytes+1))
+	if err != nil || len(raw) > maxCredentialErrorInspectBytes {
+		if anthropic || protocol == streamProtocolAnthropic {
+			writeAnthropicError(c, status, "api_error", "上游请求失败", "upstream_error")
+		} else {
+			writeOpenAIError(c, status, "upstream_error", "上游请求失败")
+		}
+		return
+	}
+	code, message := clientUpstreamErrorPayload(raw)
+	if anthropic || protocol == streamProtocolAnthropic {
+		writeAnthropicError(c, status, "invalid_request_error", message, code)
+		return
+	}
+	writeOpenAIError(c, status, code, message)
+}
+
+func clientUpstreamErrorPayload(body []byte) (code, message string) {
+	code = "upstream_error"
+	message = "上游请求失败"
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return code, message
+	}
+	var root map[string]any
+	if json.Unmarshal(trimmed, &root) != nil {
+		if text := strings.TrimSpace(string(trimmed)); text != "" && len(text) < 512 {
+			return code, text
+		}
+		return code, message
+	}
+	if value, ok := root["code"].(string); ok && strings.TrimSpace(value) != "" {
+		code = strings.TrimSpace(value)
+	}
+	if value, ok := root["error"].(string); ok && strings.TrimSpace(value) != "" {
+		return code, strings.TrimSpace(value)
+	}
+	if nested, ok := root["error"].(map[string]any); ok {
+		if value, ok := nested["message"].(string); ok && strings.TrimSpace(value) != "" {
+			message = strings.TrimSpace(value)
+		}
+		if value, ok := nested["code"].(string); ok && strings.TrimSpace(value) != "" {
+			code = strings.TrimSpace(value)
+		} else if value, ok := nested["type"].(string); ok && strings.TrimSpace(value) != "" {
+			code = strings.TrimSpace(value)
+		}
+		return code, message
+	}
+	if value, ok := root["message"].(string); ok && strings.TrimSpace(value) != "" {
+		message = strings.TrimSpace(value)
+	}
+	return code, message
 }
 
 type responseMetadata struct {
@@ -974,6 +1153,90 @@ type responseMetadata struct {
 }
 
 func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, error) {
+	metadata, _, err := copyStreamCounting(writer, source, protocol)
+	return metadata, err
+}
+
+// copyStreamLazyStatus delays WriteHeader until the first upstream body byte so a
+// dead/incomplete stream can still surface as a JSON 502 instead of HTTP 200 + empty SSE.
+func copyStreamLazyStatus(c *gin.Context, source io.Reader, protocol streamProtocol, upstreamStatus int, anthropic bool) (responseMetadata, int, error) {
+	inspector := &responseInspector{protocol: protocol}
+	buffer := make([]byte, responseCopyBufferBytes)
+	transferred := 0
+	headersSent := false
+	ensureHeaders := func() {
+		if headersSent {
+			return
+		}
+		if upstreamStatus <= 0 {
+			upstreamStatus = http.StatusOK
+		}
+		c.Status(upstreamStatus)
+		if flusher, ok := c.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		headersSent = true
+	}
+	fail := func(err error) (responseMetadata, int, error) {
+		code, message := streamErrorClientPayload(err)
+		if transferred == 0 && !headersSent {
+			if anthropic || protocol == streamProtocolAnthropic {
+				writeAnthropicError(c, http.StatusBadGateway, "api_error", message, code)
+			} else {
+				writeOpenAIError(c, http.StatusBadGateway, code, message)
+			}
+			return inspector.Metadata(), 0, err
+		}
+		// Headers already sent as 200 (or upstream status): append a protocol-native
+		// error event so SDK clients parse a real failure instead of empty SSE.
+		if !inspector.terminalFailure {
+			writeStreamTailError(c.Writer, protocol, code, message)
+		}
+		return inspector.Metadata(), transferred, err
+	}
+	for {
+		n, readErr := source.Read(buffer)
+		if n > 0 {
+			if transferred+n > maxStreamResponseTransferBytes {
+				return fail(fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20))
+			}
+			ensureHeaders()
+			chunk := buffer[:n]
+			inspector.Inspect(chunk)
+			if err := setResponseWriteDeadline(c.Writer); err != nil {
+				return fail(err)
+			}
+			if _, err := c.Writer.Write(chunk); err != nil {
+				return inspector.Metadata(), transferred, err
+			}
+			c.Writer.Flush()
+			transferred += n
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				inspector.Finish()
+				// Never flush HTTP 200 with zero body — Claude Code / sub2api treat that as
+				// "empty or malformed response (HTTP 200)" even when status looks fine.
+				if transferred == 0 {
+					if termErr := inspector.TerminalError(); termErr != nil {
+						return fail(termErr)
+					}
+					return fail(errUpstreamStreamIncomplete)
+				}
+				if termErr := inspector.TerminalError(); termErr != nil {
+					return fail(termErr)
+				}
+				return inspector.Metadata(), transferred, nil
+			}
+			if inspector.terminalSuccess {
+				return inspector.Metadata(), transferred, nil
+			}
+			return fail(fmt.Errorf("%w: %v", errUpstreamStreamRead, readErr))
+		}
+	}
+}
+
+func copyStreamCounting(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, int, error) {
 	inspector := &responseInspector{protocol: protocol}
 	buffer := make([]byte, responseCopyBufferBytes)
 	transferred := 0
@@ -981,29 +1244,121 @@ func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProt
 		n, readErr := source.Read(buffer)
 		if n > 0 {
 			if transferred+n > maxStreamResponseTransferBytes {
-				return inspector.Metadata(), fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
+				return inspector.Metadata(), transferred, fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
 			}
 			chunk := buffer[:n]
 			inspector.Inspect(chunk)
 			if err := setResponseWriteDeadline(writer); err != nil {
-				return inspector.Metadata(), err
+				return inspector.Metadata(), transferred, err
 			}
 			if _, err := writer.Write(chunk); err != nil {
-				return inspector.Metadata(), err
+				return inspector.Metadata(), transferred, err
 			}
-			writer.Flush()
+			if flusher, ok := writer.(http.Flusher); ok {
+				flusher.Flush()
+			}
 			transferred += n
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				inspector.Finish()
-				return inspector.Metadata(), inspector.TerminalError()
+				termErr := inspector.TerminalError()
+				if transferred == 0 {
+					if termErr == nil {
+						termErr = errUpstreamStreamIncomplete
+					}
+					return inspector.Metadata(), transferred, termErr
+				}
+				if termErr != nil && !inspector.terminalFailure {
+					code, message := streamErrorClientPayload(termErr)
+					writeStreamTailError(writer, protocol, code, message)
+				}
+				return inspector.Metadata(), transferred, termErr
 			}
 			if inspector.terminalSuccess {
-				return inspector.Metadata(), nil
+				return inspector.Metadata(), transferred, nil
 			}
-			return inspector.Metadata(), fmt.Errorf("%w: %v", errUpstreamStreamRead, readErr)
+			err := fmt.Errorf("%w: %v", errUpstreamStreamRead, readErr)
+			if transferred > 0 {
+				code, message := streamErrorClientPayload(err)
+				writeStreamTailError(writer, protocol, code, message)
+			}
+			return inspector.Metadata(), transferred, err
 		}
+	}
+}
+
+func streamErrorClientPayload(err error) (code, message string) {
+	switch {
+	case errors.Is(err, errResponseTransferLimit):
+		return "response_too_large", "上游响应超过代理安全上限，请缩小上下文或关闭流式重试"
+	case errors.Is(err, errUpstreamStreamFailed):
+		return "upstream_stream_error", "上游流返回失败事件，请重试"
+	case errors.Is(err, errUpstreamStreamIncomplete):
+		return "upstream_stream_incomplete", "上游流在完成前结束（未收到终止事件），请重试"
+	case errors.Is(err, errUpstreamStreamRead):
+		return "upstream_stream_interrupted", "读取上游流失败，连接可能已中断，请重试"
+	default:
+		if err == nil {
+			return "stream_interrupted", "流式响应中断，请重试"
+		}
+		return "stream_interrupted", "流式响应中断，请重试"
+	}
+}
+
+// writeStreamTailError appends a protocol-native SSE error after headers were already
+// flushed as 200, so OpenAI/Anthropic/Codex clients can surface a parseable failure.
+func writeStreamTailError(writer http.ResponseWriter, protocol streamProtocol, code, message string) {
+	if writer == nil {
+		return
+	}
+	_ = setResponseWriteDeadline(writer)
+	var payload []byte
+	switch protocol {
+	case streamProtocolResponses:
+		body, _ := json.Marshal(map[string]any{
+			"type": "response.failed",
+			"response": map[string]any{
+				"status": "failed",
+				"error": map[string]any{
+					"type":    "server_error",
+					"code":    code,
+					"message": message,
+				},
+			},
+		})
+		payload = append([]byte("data: "), body...)
+		payload = append(payload, []byte("\n\n")...)
+	case streamProtocolChat:
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": message,
+				"type":    "server_error",
+				"code":    code,
+			},
+		})
+		payload = append([]byte("data: "), body...)
+		payload = append(payload, []byte("\n\ndata: [DONE]\n\n")...)
+	case streamProtocolAnthropic:
+		body, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": message,
+			},
+		})
+		payload = append([]byte("event: error\ndata: "), body...)
+		payload = append(payload, []byte("\n\n")...)
+	default:
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{"message": message, "code": code},
+		})
+		payload = append([]byte("data: "), body...)
+		payload = append(payload, []byte("\n\n")...)
+	}
+	_, _ = writer.Write(payload)
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
 	}
 }
 
@@ -1149,7 +1504,13 @@ func (i *responseInspector) observeTerminal(data []byte) {
 		switch payload.Type {
 		case "response.completed":
 			i.terminalSuccess = true
-		case "response.failed", "response.incomplete", "response.error", "error":
+		case "response.incomplete":
+			// max_output_tokens / content filters end the stream with incomplete.
+			// That is a valid terminal event clients expect; treating it as
+			// failure made G2A mark successful partial answers as stream errors
+			// while CPA passes them through.
+			i.terminalSuccess = true
+		case "response.failed", "response.error", "error":
 			i.markTerminalFailure(data)
 		}
 	case streamProtocolChat:

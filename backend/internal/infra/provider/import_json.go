@@ -28,40 +28,63 @@ func DecodeCredentialJSONEntries[T any](data []byte, expectedProvider string, li
 		}
 
 		line := lineAtJSONOffset(data, start)
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-			return nil, fmt.Errorf("第 %d 行必须是 JSON 对象", line)
-		}
-		if rawProvider, exists := object["provider"]; exists {
-			var providerName string
-			if err := json.Unmarshal(rawProvider, &providerName); err != nil {
-				return nil, fmt.Errorf("第 %d 行的 provider 必须是字符串", line)
-			}
-			providerName = strings.TrimSpace(providerName)
-			if providerName != "" && providerName != expectedProvider {
-				return nil, fmt.Errorf("第 %d 行的 Provider 必须是 %s", line, expectedProvider)
-			}
-		}
 
-		if rawAccounts, batch := object["accounts"]; batch {
-			var values []T
-			if err := json.Unmarshal(rawAccounts, &values); err != nil {
-				return nil, fmt.Errorf("第 %d 行的 accounts 必须是 JSON 对象数组", line)
-			}
-			if err := appendCredentialJSONEntries(&entries, values, limit); err != nil {
-				return nil, err
+		// Top-level array: [{...}, {...}] — common export paste that used to fall
+		// through to plain-text line import and create garbage SSO tokens.
+		var array []json.RawMessage
+		if err := json.Unmarshal(raw, &array); err == nil && array != nil && looksLikeJSONArray(raw) {
+			for index, item := range array {
+				var object map[string]json.RawMessage
+				if err := json.Unmarshal(item, &object); err != nil || object == nil {
+					return nil, fmt.Errorf("第 %d 行数组第 %d 项必须是 JSON 对象", line, index+1)
+				}
+				if err := appendObjectCredentialJSONEntry(&entries, item, object, expectedProvider, line, limit); err != nil {
+					return nil, err
+				}
 			}
 			continue
 		}
 
-		var value T
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return nil, fmt.Errorf("第 %d 行的账号 JSON 格式无效", line)
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+			return nil, fmt.Errorf("第 %d 行必须是 JSON 对象或对象数组", line)
 		}
-		if err := appendCredentialJSONEntries(&entries, []T{value}, limit); err != nil {
+		if err := appendObjectCredentialJSONEntry(&entries, raw, object, expectedProvider, line, limit); err != nil {
 			return nil, err
 		}
 	}
+}
+
+func looksLikeJSONArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '['
+}
+
+func appendObjectCredentialJSONEntry[T any](entries *[]T, raw json.RawMessage, object map[string]json.RawMessage, expectedProvider string, line, limit int) error {
+	if rawProvider, exists := object["provider"]; exists {
+		var providerName string
+		if err := json.Unmarshal(rawProvider, &providerName); err != nil {
+			return fmt.Errorf("第 %d 行的 provider 必须是字符串", line)
+		}
+		providerName = strings.TrimSpace(providerName)
+		if providerName != "" && providerName != expectedProvider {
+			return fmt.Errorf("第 %d 行的 Provider 必须是 %s", line, expectedProvider)
+		}
+	}
+
+	if rawAccounts, batch := object["accounts"]; batch {
+		var values []T
+		if err := json.Unmarshal(rawAccounts, &values); err != nil {
+			return fmt.Errorf("第 %d 行的 accounts 必须是 JSON 对象数组", line)
+		}
+		return appendCredentialJSONEntries(entries, values, limit)
+	}
+
+	var value T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("第 %d 行的账号 JSON 格式无效", line)
+	}
+	return appendCredentialJSONEntries(entries, []T{value}, limit)
 }
 
 func appendCredentialJSONEntries[T any](target *[]T, values []T, limit int) error {

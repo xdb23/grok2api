@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -168,6 +169,39 @@ func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.C
 		ResponseHeaders:       sanitizeDiagnosticHeaders(response.Header),
 		ResponseBody:          body,
 		ResponseBodyTruncated: bodyTruncated,
+	})
+}
+
+// captureEarlyBodyFailure records a 2xx body that was rejected before client hand-off
+// (e.g. capacity error under HTTP 200) so audits show the rotated attempt.
+func (r *failureAttemptRecorder) captureEarlyBodyFailure(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, failure *UpstreamFailure) {
+	if response == nil || failure == nil {
+		return
+	}
+	statusCode := response.StatusCode
+	body, _ := r.captureBody([]byte(failure.Error()), false)
+	if failure.UpstreamCode != "" || failure.PublicMessage != "" {
+		payload, _ := json.Marshal(map[string]any{
+			"code":    failure.UpstreamCode,
+			"type":    failure.Code,
+			"message": failure.PublicMessage,
+		})
+		body, _ = r.captureBody(payload, false)
+	}
+	r.append(audit.Attempt{
+		Source:             audit.AttemptSourceUpstreamHTTP,
+		Stage:              "early_body_probe",
+		AccountID:          auditAccountID(credential.ID),
+		AccountName:        credential.Name,
+		Method:             r.method,
+		RequestPath:        r.path,
+		UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
+		StartedAt:          startedAt.UTC(),
+		DurationMS:         time.Since(startedAt).Milliseconds(),
+		UpstreamStatusCode: &statusCode,
+		UpstreamStatus:     response.Status,
+		ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
+		ResponseBody:       body,
 	})
 }
 

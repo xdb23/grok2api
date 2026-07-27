@@ -14,7 +14,7 @@ import (
 
 const (
 	maxImportAccounts = 10000
-	maxSSOTokenBytes  = 16 << 10
+	maxSSOTokenBytes  = provider.MaxSSOTokenBytes
 )
 
 type importDocument struct {
@@ -42,9 +42,15 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 	if trimmed == "" {
 		return nil, fmt.Errorf("账号文件中没有 Grok Web 账号")
 	}
-	if !strings.HasPrefix(trimmed, "{") {
-		return parsePlainTextCredentials(trimmed)
+	// JSON document / NDJSON / top-level array must not fall through to plain-text
+	// line import (that path previously treated `"name": "..."` lines as SSO tokens).
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return parseJSONCredentials(data)
 	}
+	return parsePlainTextCredentials(trimmed)
+}
+
+func parseJSONCredentials(data []byte) ([]provider.CredentialSeed, error) {
 	entries, err := provider.DecodeCredentialJSONEntries[importEntry](data, string(account.ProviderWeb), maxImportAccounts)
 	if err != nil {
 		return nil, fmt.Errorf("解析 Grok Web 账号 JSON: %w", err)
@@ -55,12 +61,9 @@ func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSe
 	seen := make(map[string]struct{}, len(entries))
 	result := make([]provider.CredentialSeed, 0, len(entries))
 	for index, entry := range entries {
-		token := sanitizeSSOToken(firstNonEmpty(entry.SSOToken, entry.Token))
-		if token == "" {
-			return nil, fmt.Errorf("第 %d 个账号缺少 sso_token", index+1)
-		}
-		if len(token) > maxSSOTokenBytes {
-			return nil, fmt.Errorf("第 %d 个账号的 sso_token 超过 16 KiB", index+1)
+		token, err := normalizeImportedSSOToken(firstNonEmpty(entry.SSOToken, entry.Token), index+1)
+		if err != nil {
+			return nil, err
 		}
 		if _, exists := seen[token]; exists {
 			continue
@@ -93,12 +96,17 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 	seen := make(map[string]struct{}, len(lines))
 	result := make([]provider.CredentialSeed, 0, len(lines))
 	for index, line := range lines {
-		token := sanitizeSSOToken(line)
-		if token == "" {
+		raw := strings.TrimSpace(line)
+		if raw == "" {
 			continue
 		}
-		if len(token) > maxSSOTokenBytes {
-			return nil, fmt.Errorf("第 %d 行的 sso token 超过 16 KiB", index+1)
+		// Refuse JSON fragments that slipped into plain-text mode.
+		if strings.HasPrefix(raw, "{") || strings.HasPrefix(raw, "[") || strings.HasPrefix(raw, "\"") {
+			return nil, fmt.Errorf("第 %d 行疑似 JSON 片段，请使用 {\"provider\":\"grok_web\",\"accounts\":[...]} 或纯 JWT 行（eyJ...）", index+1)
+		}
+		token, err := normalizeImportedSSOToken(raw, index+1)
+		if err != nil {
+			return nil, err
 		}
 		if _, exists := seen[token]; exists {
 			continue
@@ -113,7 +121,7 @@ func parsePlainTextCredentials(value string) ([]provider.CredentialSeed, error) 
 		}
 	}
 	if len(result) == 0 {
-		return nil, fmt.Errorf("文本中没有有效的 sso token")
+		return nil, fmt.Errorf("文本中没有有效的 SSO JWT")
 	}
 	return result, nil
 }
@@ -135,15 +143,19 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 	return append(data, '\n'), nil
 }
 
+func normalizeImportedSSOToken(raw string, index int) (string, error) {
+	token := provider.SanitizeSSOToken(raw)
+	if token == "" {
+		return "", fmt.Errorf("第 %d 个账号缺少 sso_token", index)
+	}
+	if err := provider.ValidateSSOToken(token); err != nil {
+		return "", fmt.Errorf("第 %d 个账号 SSO 无效: %w", index, err)
+	}
+	return token, nil
+}
+
 func sanitizeSSOToken(value string) string {
-	value = strings.TrimSpace(value)
-	if strings.HasPrefix(strings.ToLower(value), "sso=") {
-		value = strings.TrimSpace(value[len("sso="):])
-	}
-	if token, _, found := strings.Cut(value, ";"); found {
-		value = token
-	}
-	return strings.TrimSpace(strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value))
+	return provider.SanitizeSSOToken(value)
 }
 
 func firstNonEmpty(values ...string) string {

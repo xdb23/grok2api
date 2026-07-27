@@ -364,6 +364,13 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		SegmentedSelectorEnabled: segmentedEnabled,
 		SegmentedMinCandidates:   segmentedMinCandidates,
 		SegmentedWindowSize:      segmentedWindowSize,
+		// Ready-ring is startup/yaml policy for now; preserve across runtime settings reloads.
+		ReadyRingEnabled:       base.Routing.ReadyRingEnabled,
+		ReadyRingMinCandidates: base.Routing.ReadyRingMinCandidates,
+		ReadyRingWindowSize:    base.Routing.ReadyRingWindowSize,
+		// Retry policy is startup/yaml for now; preserve across runtime settings reloads.
+		RetryStatusCodes:   append([]int(nil), base.Routing.RetryStatusCodes...),
+		MaxSameFingerprint: base.Routing.MaxSameFingerprint,
 		ReasoningReplayEnabled:   base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
 	}

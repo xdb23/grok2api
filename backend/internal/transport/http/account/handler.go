@@ -148,9 +148,11 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/web/:id/nsfw", h.enableWebNSFW)
 	router.POST("/accounts/console/refresh-quotas", h.refreshAllConsoleQuotas)
 	router.POST("/accounts/refresh-billing", h.refreshAllBilling)
+	router.POST("/accounts/reset-quota", h.resetAllBuildQuota)
 	router.POST("/accounts/refresh-tokens", h.refreshAllTokens)
 	router.POST("/accounts/cleanup", h.cleanup)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
+	router.POST("/accounts/batch/reset-quota", h.batchResetQuota)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.PATCH("/accounts/batch", h.batchUpdate)
@@ -197,6 +199,8 @@ type buildConversionRequest struct {
 	IDs      []string                           `json:"ids"`
 	All      bool                               `json:"all"`
 	Strategy accountapp.BuildConversionStrategy `json:"strategy"`
+	// Force retries accounts permanently blocked by invalid_grant (default skips them).
+	Force bool `json:"force"`
 }
 
 type webConsoleSyncRequest struct {
@@ -280,9 +284,19 @@ type accountResponse struct {
 	EgressNodeID               uint64                  `json:"egressNodeId,omitempty,string"`
 	EgressAssignmentMode       string                  `json:"egressAssignmentMode,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
+	BuildConvertBlockedAt      *time.Time              `json:"buildConvertBlockedAt,omitempty"`
+	BuildConvertBlockedReason  string                  `json:"buildConvertBlockedReason,omitempty"`
+	RequestStats               *requestStatsResponse   `json:"requestStats,omitempty"`
 	Billing                    *billingResponse        `json:"billing,omitempty"`
 	Quota                      quotaResponse           `json:"quota"`
 	QuotaWindows               []quotaWindowResponse   `json:"quotaWindows,omitempty"`
+}
+
+type requestStatsResponse struct {
+	SuccessTotal int64 `json:"successTotal"`
+	FailTotal    int64 `json:"failTotal"`
+	SuccessToday int64 `json:"successToday"`
+	FailToday    int64 `json:"failToday"`
 }
 
 type linkedAccountResponse struct {
@@ -477,6 +491,38 @@ func (h *Handler) batchRefreshBilling(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
 }
 
+func (h *Handler) batchResetQuota(c *gin.Context) {
+	var request batchDeleteRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	if request.Provider != string(accountdomain.ProviderBuild) {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "仅 Grok Build 账号支持手动重置额度状态")
+		return
+	}
+	reset, err := h.service.BatchResetQuotaState(c.Request.Context(), ids)
+	if err != nil {
+		h.writeServiceError(c, "quotaBatchResetFailed", err, http.StatusInternalServerError, "批量重置额度状态失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"reset": reset})
+}
+
+func (h *Handler) resetAllBuildQuota(c *gin.Context) {
+	reset, err := h.service.ResetAllBuildQuotaState(c.Request.Context())
+	if err != nil {
+		h.writeServiceError(c, "quotaResetFailed", err, http.StatusInternalServerError, "重置全部 Grok Build 额度状态失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"reset": reset})
+}
+
 func (h *Handler) cleanup(c *gin.Context) {
 	var request accountCleanupRequest
 	if c.ShouldBindJSON(&request) != nil {
@@ -641,7 +687,7 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 			return
 		}
 	}
-	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy)
+	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy, request.Force)
 }
 
 func (h *Handler) syncWebToConsole(c *gin.Context) {
@@ -703,26 +749,26 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
 }
 
-func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
+func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, force bool, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
 	pipeline := h.startSyncPipeline(ctx, syncProgress)
 	var (
 		result accountapp.BuildConversionResult
 		err    error
 	)
 	if all {
-		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategy(pipeline.ctx, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategy(pipeline.ctx, strategy, force, pipeline.Observe, progress)
 	} else {
-		result, err = h.service.ConvertWebAccountsToBuildWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertWebAccountsToBuildWithStrategy(pipeline.ctx, ids, strategy, force, pipeline.Observe, progress)
 	}
 	syncResult := pipeline.Finish(err != nil)
 	return result, syncResult, err
 }
 
-func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy) {
+func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, force bool) {
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
+	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, force, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
 	if err != nil {
 		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
 		return
@@ -1162,7 +1208,17 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
 		EgressNodeID:               c.EgressNodeID,
 		EgressAssignmentMode:       string(c.EgressAssignmentMode),
+		BuildConvertBlockedAt:      c.BuildConvertBlockedAt,
+		BuildConvertBlockedReason:  c.BuildConvertBlockedReason,
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+	}
+	if value.RequestStats != nil {
+		result.RequestStats = &requestStatsResponse{
+			SuccessTotal: value.RequestStats.Successes,
+			FailTotal:    value.RequestStats.Failures,
+			SuccessToday: value.RequestStats.TodaySuccesses,
+			FailToday:    value.RequestStats.TodayFailures,
+		}
 	}
 	for _, linked := range c.LinkedAccounts {
 		result.LinkedAccounts = append(result.LinkedAccounts, linkedAccountResponse{ID: linked.ID, Provider: string(linked.Provider), Name: linked.Name, Email: linked.Email, UserID: linked.UserID})

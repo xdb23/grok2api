@@ -28,11 +28,18 @@ func extractPromptCacheSeed(headers http.Header, body []byte) string {
 		if seed := codexPromptCacheSeedFromHeaders(headers); seed != "" {
 			return seed
 		}
+		// NOTE: do NOT use X-Client-Request-Id / X-Request-Id here — many clients mint a
+		// unique value per HTTP call, which would thrash sticky+cache worse than soft keys.
+		if seed := normalizePromptCacheSeed(headers.Get("X-Prompt-Cache-Key")); seed != "" {
+			return seed
+		}
 		for _, name := range []string{
 			"X-Session-Id", "Session-Id", "Session_id",
 			"X-Conversation-Id", "Conversation-Id", "Conversation_id",
-			// Support session signals forwarded by reverse proxies.
-			"X-Client-Session-Id", "X-Grok-Conv-Id",
+			// Support session signals forwarded by reverse proxies / OpenCode / sub2api clients.
+			"X-Client-Session-Id", "X-Grok-Conv-Id", "X-Grok-Session-Id",
+			"X-Session-Affinity", "X-OpenCode-Session", "X-Conversation-ID",
+			"X-Chat-Id", "X-Thread-Id", "Thread-Id",
 		} {
 			if seed := normalizePromptCacheSeed(headers.Get(name)); seed != "" {
 				return seed
@@ -45,10 +52,25 @@ func extractPromptCacheSeed(headers http.Header, body []byte) string {
 		ConversationIDCamel string `json:"conversationId"`
 		SessionID           string `json:"session_id"`
 		SessionIDCamel      string `json:"sessionId"`
+		User                string `json:"user"`
+		// Some gateways put a stable chat id at the top level.
+		ChatID   string `json:"chat_id"`
+		ThreadID string `json:"thread_id"`
 		Metadata            struct {
-			SessionID      string `json:"session_id"`
-			SessionIDCamel string `json:"sessionId"`
-			UserID         string `json:"user_id"`
+			SessionID           string `json:"session_id"`
+			SessionIDCamel      string `json:"sessionId"`
+			UserID              string `json:"user_id"`
+			ConversationID      string `json:"conversation_id"`
+			ConversationIDCamel string `json:"conversationId"`
+			PromptCacheKey      string `json:"prompt_cache_key"`
+			// Common agent/gateway aliases (sub2api / OpenCode / custom proxies).
+			ChatID   string `json:"chat_id"`
+			ThreadID string `json:"thread_id"`
+			AgentID  string `json:"agent_id"`
+			// sub2api / OpenAI Responses extras
+			RequestID string `json:"request_id"`
+			TraceID   string `json:"trace_id"`
+			GrokConv  string `json:"grok_conv_id"`
 		} `json:"metadata"`
 		ClientMetadata map[string]json.RawMessage `json:"client_metadata"`
 	}
@@ -60,20 +82,55 @@ func extractPromptCacheSeed(headers http.Header, body []byte) string {
 	if seed := normalizePromptCacheSeed(payload.PromptCacheKey); seed != "" {
 		return seed
 	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.PromptCacheKey); seed != "" {
+		return seed
+	}
 	if seed := normalizePromptCacheSeed(payload.Metadata.SessionID); seed != "" {
 		return seed
 	}
 	if seed := normalizePromptCacheSeed(payload.Metadata.SessionIDCamel); seed != "" {
 		return seed
 	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.ConversationID); seed != "" {
+		return seed
+	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.ConversationIDCamel); seed != "" {
+		return seed
+	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.ChatID); seed != "" {
+		return seed
+	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.ThreadID); seed != "" {
+		return seed
+	}
+	if seed := normalizePromptCacheSeed(payload.Metadata.GrokConv); seed != "" {
+		return seed
+	}
 	if seed := promptCacheSeedFromUserID(payload.Metadata.UserID); seed != "" {
 		return claudeCodePromptCacheSeed(seed, headers)
+	}
+	// Top-level OpenAI-style user is a weak but stable multi-turn signal when no session id exists.
+	// Lower threshold to 4: short stable user ids still beat soft first-user hashing.
+	if seed := normalizePromptCacheSeed(payload.User); seed != "" && len(seed) >= 4 {
+		return "user:" + seed
+	}
+	if seed := normalizePromptCacheSeed(payload.ChatID); seed != "" {
+		return "chat:" + seed
+	}
+	if seed := normalizePromptCacheSeed(payload.ThreadID); seed != "" {
+		return "thread:" + seed
 	}
 	if seed := codexPromptCacheSeedFromRawTurnMetadata(payload.ClientMetadata["x-codex-turn-metadata"]); seed != "" {
 		return seed
 	}
 	if seed := normalizeRawPromptCacheSeed(payload.ClientMetadata["x-codex-window-id"]); seed != "" {
 		return "codex:window:" + seed
+	}
+	// client_metadata may carry session aliases from sub2api / custom gateways.
+	for _, key := range []string{"session_id", "sessionId", "conversation_id", "conversationId", "prompt_cache_key", "chat_id", "thread_id"} {
+		if seed := normalizeRawPromptCacheSeed(payload.ClientMetadata[key]); seed != "" {
+			return "meta:" + key + ":" + seed
+		}
 	}
 	if seed := normalizePromptCacheSeed(payload.SessionID); seed != "" {
 		return seed
@@ -92,13 +149,11 @@ func claudeCodePromptCacheSeed(sessionID string, headers http.Header) string {
 	if sessionID == "" {
 		return ""
 	}
-	agentID := "main"
-	if headers != nil {
-		if value := normalizePromptCacheSeed(headers.Get("X-Claude-Code-Agent-Id")); value != "" {
-			agentID = value
-		}
-	}
-	return "claude:" + sessionID + ":agent:" + agentID
+	// Align with CPA ClaudeCodePromptCache: one session → one prompt_cache_key / sticky
+	// binding. Do NOT split by X-Claude-Code-Agent-Id — main/subagent would otherwise
+	// thrash across accounts and never warm deep multi-turn cache (CPA keeps session-only).
+	_ = headers
+	return "claude:" + sessionID
 }
 
 func codexPromptCacheSeedFromHeaders(headers http.Header) string {

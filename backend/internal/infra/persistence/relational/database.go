@@ -44,7 +44,9 @@ func OpenSQLite(ctx context.Context, path string) (*Database, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据库目录: %w", err)
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate", path)
+	// busy_timeout 15s: under high concurrent finalization SQLite writers queue instead of
+	// immediately failing request ownership/audit with context deadline exceeded.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_txlock=immediate", path)
 	db, err := gorm.Open(glebarezsqlite.Open(dsn), gormConfig())
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite: %w", err)

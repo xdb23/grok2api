@@ -164,6 +164,78 @@ func TestEnsureCredentialRefreshesWhenAccessTokenIsMissing(t *testing.T) {
 	}
 }
 
+func TestCredentialUsableOnHotPathTable(t *testing.T) {
+	now := time.Date(2026, 7, 26, 1, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		token  string
+		expiry time.Time
+		usable bool
+		nudge  bool
+	}{
+		{name: "missing token", token: "", expiry: now.Add(time.Hour), usable: false, nudge: false},
+		{name: "far from expiry", token: "access", expiry: now.Add(time.Hour), usable: true, nudge: false},
+		{name: "inside advance window", token: "access", expiry: now.Add(2 * time.Minute), usable: true, nudge: true},
+		{name: "inside hot-path skew", token: "access", expiry: now.Add(5 * time.Second), usable: false, nudge: false},
+		{name: "already expired", token: "access", expiry: now.Add(-time.Minute), usable: false, nudge: false},
+		{name: "zero expiry with token", token: "access", expiry: time.Time{}, usable: true, nudge: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotUsable, gotNudge := credentialUsableOnHotPath(accountdomain.Credential{
+				EncryptedAccessToken: tc.token,
+				ExpiresAt:            tc.expiry,
+			}, now)
+			if gotUsable != tc.usable || gotNudge != tc.nudge {
+				t.Fatalf("usable/nudge = %v/%v, want %v/%v", gotUsable, gotNudge, tc.usable, tc.nudge)
+			}
+		})
+	}
+}
+
+func TestEnsureCredentialHotPathDoesNotBlockOnProactiveRefresh(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	service.now = func() time.Time { return now }
+	adapter.delay = 80 * time.Millisecond
+
+	// Token still valid for 2 minutes: inside advance window but outside hot-path skew.
+	// Hot path must return immediately without waiting on OAuth.
+	credential, err := service.accounts.UpdateTokens(ctx, credential.ID, "access-live", "refresh-0", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	got, err := service.EnsureCredential(ctx, credential, false)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EncryptedAccessToken != "access-live" {
+		t.Fatalf("hot path token = %q, want access-live", got.EncryptedAccessToken)
+	}
+	if adapter.refreshCount.Load() != 0 {
+		t.Fatalf("proactive refresh blocked hot path: count=%d", adapter.refreshCount.Load())
+	}
+	if elapsed >= adapter.delay {
+		t.Fatalf("hot path waited on OAuth: elapsed=%s delay=%s", elapsed, adapter.delay)
+	}
+
+	// Token already inside hot-path skew: must sync-refresh.
+	credential, err = service.accounts.UpdateTokens(ctx, credential.ID, "access-expiring", "refresh-0", now.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := service.EnsureCredential(ctx, credential, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refreshCount.Load() != 1 || refreshed.EncryptedAccessToken != "access-1" {
+		t.Fatalf("near-expiry hot path must sync refresh: %#v count=%d", refreshed, adapter.refreshCount.Load())
+	}
+}
+
 func TestCredentialRefreshSchedulerRefreshesOnlyDueAccounts(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()

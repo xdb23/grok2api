@@ -53,6 +53,8 @@ func toAccountDomain(value accountModel) account.Credential {
 	var webTermsAcceptedAt *time.Time
 	var webTermsAcceptedVersion int
 	var webBirthDateSetAt *time.Time
+	var buildConvertBlockedAt *time.Time
+	var buildConvertBlockedReason string
 	var egressIdentity string
 	if value.WebProfile != nil {
 		webTier = account.WebTier(value.WebProfile.Tier)
@@ -63,6 +65,8 @@ func toAccountDomain(value accountModel) account.Credential {
 			webTermsAcceptedAt = value.WebProfile.TermsAcceptedAt
 		}
 		webBirthDateSetAt = value.WebProfile.BirthDateSetAt
+		buildConvertBlockedAt = value.WebProfile.BuildConvertBlockedAt
+		buildConvertBlockedReason = value.WebProfile.BuildConvertBlockedReason
 		egressIdentity = value.WebProfile.EgressIdentity
 	}
 	buildRouteMode := account.BuildRouteMode(value.BuildRouteMode)
@@ -79,7 +83,8 @@ func toAccountDomain(value accountModel) account.Credential {
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
-		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
+		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt,
+		BuildConvertBlockedAt: buildConvertBlockedAt, BuildConvertBlockedReason: buildConvertBlockedReason, EgressIdentity: egressIdentity,
 		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
@@ -160,7 +165,11 @@ func fromWebProfileDomain(value account.Credential) *webAccountProfileModel {
 	if tier == "" {
 		tier = account.WebTierAuto
 	}
-	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
+	return &webAccountProfileModel{
+		AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt,
+		TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt,
+		BuildConvertBlockedAt: value.BuildConvertBlockedAt, BuildConvertBlockedReason: value.BuildConvertBlockedReason, EgressIdentity: value.EgressIdentity,
+	}
 }
 
 func accountIdentity(value account.Credential) string {
@@ -206,6 +215,9 @@ func toAuditDomain(value requestAuditModel) audit.Record {
 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, DurationMS: value.DurationMS,
+		TTFTMS: value.TTFTMS, FirstHeadersMS: value.FirstHeadersMS, SelectionMS: value.SelectionMS,
+		CredentialMS: value.CredentialMS, UpstreamWaitMS: value.UpstreamWaitMS, UpstreamAttempts: value.UpstreamAttempts,
+		TokensPerSecond: value.TokensPerSecond,
 		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
 	}
 }

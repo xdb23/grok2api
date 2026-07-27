@@ -90,22 +90,43 @@ func TestSelectorLayeredCacheReusesBaseAcrossModels(t *testing.T) {
 	}
 
 	selector.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountBillingChanged, Provider: account.ProviderBuild})
+	// Stale-while-revalidate: hot path must keep serving without blocking on reload.
 	if _, err := selector.loadCandidates(context.Background(), account.ProviderBuild, "model-a", "", now); err != nil {
 		t.Fatal(err)
 	}
 	baseCalls, modelACalls = repo.callCounts("model-a")
-	if baseCalls != 2 || modelACalls != 1 {
-		t.Fatalf("base invalidation reloaded base=%d overlay=%d", baseCalls, modelACalls)
+	if baseCalls != 1 || modelACalls != 1 {
+		t.Fatalf("SWR must not block-reload on base invalidation: base=%d overlay=%d", baseCalls, modelACalls)
 	}
+	waitFor(t, func() bool {
+		baseCalls, _ = repo.callCounts("model-a")
+		return baseCalls >= 2
+	}, "background base refresh after billing invalidation")
 
 	selector.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountCapabilityChanged, Provider: account.ProviderBuild})
 	if _, err := selector.loadCandidates(context.Background(), account.ProviderBuild, "model-a", "", now); err != nil {
 		t.Fatal(err)
 	}
 	baseCalls, modelACalls = repo.callCounts("model-a")
-	if baseCalls != 2 || modelACalls != 2 {
-		t.Fatalf("overlay invalidation reloaded base=%d overlay=%d", baseCalls, modelACalls)
+	if modelACalls != 1 {
+		t.Fatalf("SWR must not block-reload overlay: base=%d overlay=%d", baseCalls, modelACalls)
 	}
+	waitFor(t, func() bool {
+		_, modelACalls = repo.callCounts("model-a")
+		return modelACalls >= 2
+	}, "background overlay refresh after capability invalidation")
+}
+
+func waitFor(t *testing.T, ready func() bool, label string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ready() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", label)
 }
 
 func TestSelectorLayeredLoadRetriesInsteadOfMixingVersions(t *testing.T) {

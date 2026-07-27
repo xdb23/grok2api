@@ -17,12 +17,18 @@ type buildSessionIdentity struct {
 	// upstreamID is sent as prompt_cache_key and x-grok-conv-id and must remain stable across turns.
 	upstreamID string
 	// affinityKey controls account stickiness and is isolated by model to avoid cross-model collisions.
+	// Soft multi-turn may encode primary+fallback (CPA dual-key inheritance) so turn-2+ can resolve
+	// the turn-1 binding without rotating the upstream prompt_cache_key.
 	affinityKey string
 	// replayKey is derived only from explicit client session signals; soft anchors must not drive encrypted reasoning replay.
 	replayKey string
 	// soft indicates a fallback identity derived from message content when no explicit session is available.
 	soft bool
 }
+
+// affinityKeySeparator joins primary+fallback soft affinity digests (must not appear in hex digests).
+const affinityKeySeparator = "\x1e"
+
 
 // resolveBuildSessionIdentity derives a stable Grok Build session identity:
 // 1. Prefer explicit client session signals, isolated by client key, provider, and model.
@@ -49,20 +55,61 @@ func resolveBuildSessionIdentity(clientKeyID uint64, provider accountdomain.Prov
 			replayKey:   hexDigest(replaySource),
 		}
 	}
-	// Fall back to a message-prefix hash to keep account affinity and session IDs stable without client session signals.
-	system, firstUser, _ := extractMessageAnchors(body)
-	firstUser = truncateAnchor(firstUser, 200)
-	system = truncateAnchor(system, 100)
+	// Soft fallback when the client sends no session header / prompt_cache_key.
+	// IMPORTANT: do NOT hash system/instructions — coding agents rewrite system every turn
+	// (cwd, git, date, open files). Including system made soft keys thrash, so existing
+	// multi-turn chats never warmed xAI prompt cache while brand-new chats looked fine.
+	// CPA avoids this by always using an explicit Claude/Codex session id.
+	// Soft upstream key is anchored only on the first user message (stable across turns).
+	// Soft affinity uses CPA-style dual keys: fallback=firstUser, primary=firstUser+firstAssistant
+	// when assistant exists, so turn-2+ inherits the turn-1 account binding without rotating
+	// the upstream prompt_cache_key (which would cold-start xAI cache).
+	// Whitespace is normalized so trivial formatting drift does not split the cache key.
+	_, firstUser, firstAssistant := extractMessageAnchors(body)
+	firstUser = normalizeSoftUserAnchor(firstUser, 200)
+	firstAssistant = normalizeSoftUserAnchor(firstAssistant, 120)
 	if firstUser == "" {
 		return buildSessionIdentity{}
 	}
-	upstreamSource := fmt.Sprintf("grok2api:build-soft-session:%s:%d:%s:%s:%s:%s", buildSessionIdentityVersion, clientKeyID, provider, model, system, firstUser)
-	affinitySource := fmt.Sprintf("grok2api:build-soft-affinity:%s:%d:%s:%s:%s:%s", buildSessionIdentityVersion, clientKeyID, provider, model, system, firstUser)
+	const softAnchorVersion = "v6-first-user-dual-aff"
+	upstreamSource := fmt.Sprintf("grok2api:build-soft-session:%s:%s:%d:%s:%s:%s", buildSessionIdentityVersion, softAnchorVersion, clientKeyID, provider, model, firstUser)
+	fallbackAffinity := hexDigest(fmt.Sprintf("grok2api:build-soft-affinity:%s:%s:%d:%s:%s:%s", buildSessionIdentityVersion, softAnchorVersion, clientKeyID, provider, model, firstUser))
+	affinityKey := fallbackAffinity
+	if firstAssistant != "" {
+		primaryAffinity := hexDigest(fmt.Sprintf("grok2api:build-soft-affinity:%s:%s:%d:%s:%s:%s|a:%s", buildSessionIdentityVersion, softAnchorVersion, clientKeyID, provider, model, firstUser, firstAssistant))
+		affinityKey = primaryAffinity + affinityKeySeparator + fallbackAffinity
+	}
 	return buildSessionIdentity{
 		upstreamID:  digestUUID(upstreamSource),
-		affinityKey: hexDigest(affinitySource),
+		affinityKey: affinityKey,
 		soft:        true,
 	}
+}
+
+// normalizeSoftUserAnchor stabilizes soft session keys across minor client formatting
+// differences (CRLF vs LF, repeated spaces/tabs) without changing semantic content.
+func normalizeSoftUserAnchor(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	prevSpace := false
+	for _, r := range value {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\u00a0':
+			if prevSpace {
+				continue
+			}
+			b.WriteByte(' ')
+			prevSpace = true
+		default:
+			b.WriteRune(r)
+			prevSpace = false
+		}
+	}
+	return truncateAnchor(b.String(), maxRunes)
 }
 
 func digestUUID(source string) string {

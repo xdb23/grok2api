@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,17 +24,32 @@ import (
 
 const (
 	ssoBuildClientID = "b1a00492-073a-47ea-816f-4c329264a828"
-	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
-	// ssoBuildClientVersion is sent on Device OAuth requests. New principals may
-	// require a recent grok-shell version (e.g. 0.2.111) for grok-4.5 grants.
+	// Match the proven theyka/protocol_mint device OAuth scope (conversations + cli/api).
+	// Soft accounts.x.ai warm-up + this scope is what succeeds for reserve SSO remints.
+	ssoBuildScope = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
+	// ssoBuildClientVersion is sent on Device OAuth CLI requests (device/code + token).
+	// protocol_mint uses 0.2.93; keep a recent grok-shell for newer grants.
 	ssoBuildClientVersion    = "0.2.111"
 	ssoBuildClientIdentifier = "grok-shell"
-	ssoAccountsURL           = "https://accounts.x.ai/"
-	ssoDeviceURL             = "https://auth.x.ai/oauth2/device/code"
-	ssoVerifyURL             = "https://auth.x.ai/oauth2/device/verify"
-	ssoApproveURL            = "https://auth.x.ai/oauth2/device/approve"
-	ssoTokenURL              = "https://auth.x.ai/oauth2/token"
-	maxAuthBody              = 2 << 20
+	ssoBuildShellUA          = "grok-shell/" + ssoBuildClientVersion + " (linux; x86_64)"
+	// Browser fingerprint for accounts.x.ai verify/approve (matches local mint BROWSER_UA).
+	ssoBuildBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	ssoAccountsURL    = "https://accounts.x.ai/"
+	// console session is used to resolve principal_id when Web account user_id is empty.
+	ssoConsoleSessionURL = "https://console.x.ai/api/auth/session"
+	ssoDeviceURL         = "https://auth.x.ai/oauth2/device/code"
+	ssoVerifyURL         = "https://auth.x.ai/oauth2/device/verify"
+	ssoApproveURL        = "https://auth.x.ai/oauth2/device/approve"
+	ssoTokenURL          = "https://auth.x.ai/oauth2/token"
+	maxAuthBody          = 2 << 20
+)
+
+// requestStyle selects CLI vs browser header profile for each OAuth step.
+type requestStyle int
+
+const (
+	styleBrowser requestStyle = iota
+	styleCLI
 )
 
 type ssoBuildHTTPClient interface {
@@ -41,9 +57,12 @@ type ssoBuildHTTPClient interface {
 }
 
 type ssoBuildFlow struct {
-	client    ssoBuildHTTPClient
-	userAgent string
-	cookies   map[string]string
+	client      ssoBuildHTTPClient
+	userAgent   string
+	cookies     map[string]string
+	principalID string
+	castleToken string
+	lastReferer string
 }
 
 func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
@@ -66,11 +85,23 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	flow := &ssoBuildFlow{
-		client: lease, userAgent: lease.UserAgent,
-		cookies: map[string]string{"sso": token, "sso-rw": token},
+		client:      lease,
+		userAgent:   lease.UserAgent,
+		cookies:     map[string]string{"sso": token, "sso-rw": token},
+		principalID: strings.TrimSpace(credential.UserID),
 	}
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
+		// Pure-Go Device Flow often gets accounts.x.ai HTTP 403 on approve for reserve SSO.
+		// Fall back to the proven theyka mint_with_sso_protocol (Docker + curl_cffi + same proxy).
+		if isConvertPortal403(err) && strings.TrimSpace(lease.ProxyURL) != "" {
+			if mintSeed, mintErr := convertViaProtocolMint(requestCtx, token, lease.ProxyURL, credential.Email, credential.Name); mintErr == nil {
+				a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+				return mintSeed, nil
+			} else {
+				err = fmt.Errorf("%w; protocol mint fallback: %v", err, mintErr)
+			}
+		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
 		return provider.CredentialSeed{}, err
 	}
@@ -79,20 +110,22 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 }
 
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
-	status, finalURL, _, err := f.do(ctx, http.MethodGet, ssoAccountsURL, nil)
-	if err != nil {
-		return provider.CredentialSeed{}, err
-	}
-	if status == http.StatusUnauthorized || strings.Contains(finalURL, "sign-in") || strings.Contains(finalURL, "sign-up") {
-		return provider.CredentialSeed{}, provider.ErrUnauthorized
-	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("校验 Grok Web SSO 失败: %w", conversionHTTPError{status: status})
+	// 1) Skip hard accounts.x.ai portal warm-up.
+	// protocol_mint may GET the portal, but a 403 there is non-fatal. In G2A, Lease.Do also
+	// invalidates the browser/clearance session on any 403, which then poisons verify/approve.
+	// SSO cookies are already attached on the flow; start Device OAuth directly.
+	if strings.TrimSpace(f.principalID) == "" {
+		f.principalID = strings.TrimSpace(credential.UserID)
 	}
 
-	// Align with production mint: referrer=grok-build is required by some grant paths.
-	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}, "referrer": {"grok-build"}}
-	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
+	// 2) Device code with CLI fingerprint. Include referrer=grok-build like protocol_mint
+	// / oauth_device.request_device_code (form field; JWT may still omit referrer claim).
+	form := url.Values{
+		"client_id": {ssoBuildClientID},
+		"scope":     {ssoBuildScope},
+		"referrer":  {"grok-build"},
+	}
+	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form, styleCLI)
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
@@ -119,28 +152,56 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		device.ExpiresIn = 1800
 	}
 
-	status, finalURL, _, err = f.do(ctx, http.MethodGet, device.VerificationURIComplete, nil)
+	// 4) Open verification page (browser). Some tenants land on consent directly.
+	// protocol_mint does not hard-fail a non-2xx GET here; it always posts verify next.
+	var finalURL string
+	status, finalURL, body, err = f.do(ctx, http.MethodGet, device.VerificationURIComplete, nil, styleBrowser)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		status, finalURL, body = 0, device.VerificationURIComplete, nil
 	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("打开 Device Flow 验证页失败: %w", conversionHTTPError{status: status})
+	f.lastReferer = device.VerificationURIComplete
+	if status >= 200 && status < 400 {
+		f.harvestCastleFromHTML(string(body))
+		f.harvestPrincipalFromHTML(string(body))
 	}
-	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}})
-	if err != nil {
-		return provider.CredentialSeed{}, err
+	onConsent := strings.Contains(finalURL, "consent") || isConsentHTML(string(body))
+
+	// 5) POST verify when GET did not already reach consent (mint always POSTs verify).
+	if !onConsent {
+		status, finalURL, body, err = f.do(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}}, styleBrowser)
+		if err != nil {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", err)
+		}
+		// Accept 2xx/3xx, or a body/URL that already signals consent/done even on odd status.
+		f.harvestCastleFromHTML(string(body))
+		f.harvestPrincipalFromHTML(string(body))
+		okConsent := strings.Contains(finalURL, "consent") || isConsentHTML(string(body)) || strings.Contains(finalURL, "done")
+		if (status < 200 || status >= 400) && !okConsent {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
+		}
+		if !okConsent {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
+		}
+		if strings.Contains(finalURL, "consent") {
+			f.lastReferer = finalURL
+		} else {
+			f.lastReferer = "https://accounts.x.ai/oauth2/device/consent?user_code=" + url.QueryEscape(device.UserCode)
+		}
+	} else if strings.Contains(finalURL, "consent") {
+		f.lastReferer = finalURL
+	} else {
+		f.lastReferer = "https://accounts.x.ai/oauth2/device/consent?user_code=" + url.QueryEscape(device.UserCode)
 	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
+
+	// 6) Approve. Match protocol_mint fields exactly (empty principal_id is valid).
+	// Do not attach harvested Castle tokens: mint never sends them, and bad tokens can 403.
+	approve := url.Values{
+		"user_code":      {device.UserCode},
+		"action":         {"allow"},
+		"principal_type": {"User"},
+		"principal_id":   {f.principalID},
 	}
-	if !strings.Contains(finalURL, "consent") {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
-	}
-	// principal_id should match the SSO user when known (empty is accepted by some tenants).
-	principalID := strings.TrimSpace(credential.UserID)
-	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoApproveURL, url.Values{
-		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {principalID},
-	})
+	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoApproveURL, approve, styleBrowser)
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
@@ -151,6 +212,7 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败")
 	}
 
+	// 7) Poll token with CLI fingerprint.
 	token, err := f.pollToken(ctx, device.DeviceCode, time.Duration(device.Interval)*time.Second, time.Duration(device.ExpiresIn)*time.Second)
 	if err != nil {
 		return provider.CredentialSeed{}, err
@@ -192,8 +254,10 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 		case <-timer.C:
 		}
 		status, _, body, err := f.do(ctx, http.MethodPost, ssoTokenURL, url.Values{
-			"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "client_id": {ssoBuildClientID}, "device_code": {deviceCode},
-		})
+			"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+			"client_id":   {ssoBuildClientID},
+			"device_code": {deviceCode},
+		}, styleCLI)
 		if err != nil {
 			return ssoBuildToken{}, err
 		}
@@ -222,7 +286,14 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 			continue
 		case "access_denied", "expired_token":
 			return ssoBuildToken{}, provider.ErrAuthorizationDenied
+		case "invalid_grant":
+			return ssoBuildToken{}, fmt.Errorf("%w: %s", provider.ErrInvalidGrant, firstValue(payload.ErrorDescription, payload.Error))
 		default:
+			// Some gateways only put invalid_grant in the free-form description.
+			combined := strings.ToLower(firstValue(payload.ErrorDescription, payload.Error))
+			if strings.Contains(combined, "invalid_grant") {
+				return ssoBuildToken{}, fmt.Errorf("%w: %s", provider.ErrInvalidGrant, firstValue(payload.ErrorDescription, payload.Error))
+			}
 			if status >= 400 {
 				return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 (%s): %w", firstValue(payload.ErrorDescription, payload.Error), conversionHTTPError{status: status})
 			}
@@ -232,7 +303,25 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 	return ssoBuildToken{}, fmt.Errorf("xAI Device Flow 轮询超时")
 }
 
-func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url.Values) (int, string, []byte, error) {
+func (f *ssoBuildFlow) resolvePrincipalID(ctx context.Context) string {
+	status, _, body, err := f.do(ctx, http.MethodGet, ssoConsoleSessionURL, nil, styleBrowser)
+	if err != nil || status < 200 || status >= 300 {
+		return ""
+	}
+	var doc map[string]any
+	if json.Unmarshal(body, &doc) != nil {
+		return ""
+	}
+	// Shape: { "session": { "userId": "..." } } or flat userId.
+	if session, ok := doc["session"].(map[string]any); ok {
+		if uid := firstValue(asString(session["userId"]), asString(session["user_id"]), asString(session["sub"])); uid != "" {
+			return uid
+		}
+	}
+	return firstValue(asString(doc["userId"]), asString(doc["user_id"]), asString(doc["sub"]))
+}
+
+func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url.Values, style requestStyle) (int, string, []byte, error) {
 	if !safeXAIURL(endpoint) {
 		return 0, "", nil, fmt.Errorf("xAI OAuth URL 不安全")
 	}
@@ -248,24 +337,7 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		if err != nil {
 			return 0, "", nil, err
 		}
-		request.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
-		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-		request.Header.Set("User-Agent", firstValue(f.userAgent, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"))
-		request.Header.Set("Cookie", f.cookieHeader())
-		// Critical for newer principals / grok-4.5 Build grants on device OAuth.
-		request.Header.Set("x-grok-client-version", ssoBuildClientVersion)
-		request.Header.Set("x-grok-client-identifier", ssoBuildClientIdentifier)
-		// Browser-like headers for accounts.x.ai / auth.x.ai device OAuth (matches local mint).
-		if host := request.URL.Host; strings.Contains(host, "x.ai") {
-			request.Header.Set("Origin", "https://accounts.x.ai")
-			request.Header.Set("Referer", "https://accounts.x.ai/")
-			request.Header.Set("Sec-Fetch-Dest", "empty")
-			request.Header.Set("Sec-Fetch-Mode", "cors")
-			request.Header.Set("Sec-Fetch-Site", "same-site")
-		}
-		if currentForm != nil {
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		}
+		f.applyHeaders(request, style, currentForm != nil)
 		response, err := f.client.Do(request)
 		if err != nil {
 			return 0, "", nil, err
@@ -295,12 +367,67 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		if !safeXAIURL(currentURL) {
 			return response.StatusCode, currentURL, data, fmt.Errorf("xAI OAuth 重定向到非受信域名")
 		}
+		// Track browser referer for subsequent consent/approve posts.
+		if style == styleBrowser {
+			f.lastReferer = currentURL
+		}
 		if response.StatusCode == http.StatusSeeOther || ((response.StatusCode == http.StatusMovedPermanently || response.StatusCode == http.StatusFound) && currentMethod != http.MethodGet && currentMethod != http.MethodHead) {
 			currentMethod = http.MethodGet
 			currentForm = nil
 		}
 	}
 	return 0, currentURL, nil, fmt.Errorf("xAI OAuth 重定向次数过多")
+}
+
+func (f *ssoBuildFlow) applyHeaders(request *http.Request, style requestStyle, hasForm bool) {
+	request.Header.Set("Cookie", f.cookieHeader())
+	switch style {
+	case styleCLI:
+		// grok-shell / CPA device_oauth request_session profile.
+		request.Header.Set("Accept", "*/*")
+		request.Header.Set("User-Agent", ssoBuildShellUA)
+		request.Header.Set("x-grok-client-version", ssoBuildClientVersion)
+		request.Header.Set("x-grok-client-identifier", ssoBuildClientIdentifier)
+		request.Header.Set("x-grok-client-surface", "headless")
+		request.Header.Set("x-grok-client-mode", "headless")
+		request.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	default:
+		// Browser profile for accounts.x.ai / console.x.ai.
+		ua := firstValue(f.userAgent, ssoBuildBrowserUA)
+		// Prefer a real Chrome UA when lease UA is empty or looks like a bot/shell.
+		if strings.Contains(strings.ToLower(ua), "grok-shell") || strings.Contains(strings.ToLower(ua), "python") {
+			ua = ssoBuildBrowserUA
+		}
+		request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7")
+		request.Header.Set("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8")
+		request.Header.Set("User-Agent", ua)
+		request.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
+		request.Header.Set("sec-ch-ua-mobile", "?0")
+		request.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		// Also send client version so accounts side sees recent grok client.
+		request.Header.Set("x-grok-client-version", ssoBuildClientVersion)
+		request.Header.Set("x-grok-client-identifier", ssoBuildClientIdentifier)
+		if host := request.URL.Host; strings.Contains(host, "x.ai") {
+			if strings.Contains(host, "console.x.ai") {
+				request.Header.Set("Origin", "https://console.x.ai")
+				request.Header.Set("Referer", firstValue(f.lastReferer, "https://console.x.ai/"))
+			} else {
+				request.Header.Set("Origin", "https://accounts.x.ai")
+				request.Header.Set("Referer", firstValue(f.lastReferer, "https://accounts.x.ai/"))
+			}
+			request.Header.Set("Sec-Fetch-Dest", "empty")
+			request.Header.Set("Sec-Fetch-Mode", "cors")
+			request.Header.Set("Sec-Fetch-Site", "same-site")
+		}
+		// Optional Castle request token as header (some frontends forward it this way).
+		if token := strings.TrimSpace(f.castleToken); token != "" {
+			request.Header.Set("x-castle-request-token", token)
+			request.Header.Set("X-Castle-Request-Token", token)
+		}
+	}
+	if hasForm {
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 }
 
 func (f *ssoBuildFlow) captureCookies(response *http.Response) {
@@ -315,6 +442,11 @@ func (f *ssoBuildFlow) captureCookies(response *http.Response) {
 			continue
 		}
 		f.cookies[name] = value
+		// Castle / CF cookies sometimes carry a short-lived request token-like value.
+		lower := strings.ToLower(name)
+		if f.castleToken == "" && (strings.Contains(lower, "castle") || lower == "__cuid" || lower == "castle_id") && len(value) >= 20 {
+			f.castleToken = value
+		}
 	}
 }
 
@@ -329,6 +461,39 @@ func (f *ssoBuildFlow) cookieHeader() string {
 		parts = append(parts, key+"="+f.cookies[key])
 	}
 	return strings.Join(parts, "; ")
+}
+
+var (
+	principalInputRe = regexp.MustCompile(`(?i)name=["']principal_id["'][^>]*value=["']([^"']*)["']|value=["']([^"']*)["'][^>]*name=["']principal_id["']`)
+	castleTokenRe    = regexp.MustCompile(`(?i)(?:castleRequestToken|castle_request_token|createRequestToken)["'\s:=]+["']([A-Za-z0-9._\-]{20,})["']`)
+	consentSignalRe  = regexp.MustCompile(`(?i)device/approve|principal_type|authorize grok build|action=["']allow["']`)
+)
+
+func (f *ssoBuildFlow) harvestPrincipalFromHTML(html string) {
+	if f.principalID != "" || html == "" {
+		return
+	}
+	if m := principalInputRe.FindStringSubmatch(html); len(m) > 0 {
+		uid := strings.TrimSpace(firstValue(m[1], m[2]))
+		if uid != "" {
+			f.principalID = uid
+		}
+	}
+}
+
+func (f *ssoBuildFlow) harvestCastleFromHTML(html string) {
+	if f.castleToken != "" || html == "" {
+		return
+	}
+	if m := castleTokenRe.FindStringSubmatch(html); len(m) > 1 {
+		if token := strings.TrimSpace(m[1]); len(token) >= 20 {
+			f.castleToken = token
+		}
+	}
+}
+
+func isConsentHTML(html string) bool {
+	return consentSignalRe.MatchString(html)
 }
 
 func safeXAIURL(raw string) bool {
@@ -370,6 +535,20 @@ func decodeBuildClaims(token string) map[string]any {
 func claimString(claims map[string]any, key string) string {
 	value, _ := claims[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func asString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strings.TrimSpace(strconv.FormatFloat(v, 'f', -1, 64))
+	default:
+		return ""
+	}
 }
 
 func firstValue(values ...string) string {

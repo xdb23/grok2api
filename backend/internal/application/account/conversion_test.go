@@ -107,7 +107,7 @@ func TestConvertWebAccountsToBuildAllRefreshesLinkedCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refreshed, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionAll, nil, nil)
+	refreshed, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionAll, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestConvertAllWebAccountsToBuildUsesUnlinkedPool(t *testing.T) {
 	if empty.Created != 0 || empty.Linked != 0 || empty.Skipped != 0 || empty.Failed != 0 || len(empty.BuildAccountIDs) != 0 || adapter.calls.Load() != 2 {
 		t.Fatalf("empty conversion = %#v, calls = %d", empty, adapter.calls.Load())
 	}
-	resynced, err := service.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionAll, nil, nil)
+	resynced, err := service.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionAll, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ type conversionBatchRepository struct {
 	nextBuildID  atomic.Uint64
 }
 
-func (r *conversionBatchRepository) ListUnlinkedWebAccountIDs(_ context.Context, afterID uint64, limit int) ([]uint64, int64, error) {
+func (r *conversionBatchRepository) ListUnlinkedWebAccountIDs(_ context.Context, afterID uint64, limit int, _ bool) ([]uint64, int64, error) {
 	r.listCalls++
 	ids := make([]uint64, 0, limit)
 	for id := afterID + 1; id <= uint64(r.total) && len(ids) < limit; id++ {
@@ -273,6 +273,103 @@ func (a *buildConversionAdapter) ConvertToBuild(_ context.Context, credential ac
 	return provider.CredentialSeed{
 		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "build", UserID: credential.SourceKey,
 		SourceKey: fmt.Sprintf("converted:%s:%d", credential.SourceKey, call), OIDCClientID: "client",
+		AccessToken: fmt.Sprintf("access-%d", call), RefreshToken: fmt.Sprintf("refresh-%d", call), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}, nil
+}
+
+func TestConvertWebAccountsToBuildBlocksInvalidGrantAndForceRetries(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "conversion-block.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedSSO, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAccountRepository(database)
+	webAccount, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-block", SourceKey: "web-block-source",
+		EncryptedAccessToken: encryptedSSO, Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &buildConversionFailAdapter{err: provider.ErrInvalidGrant}
+	service := NewService(repo, nil, nil, nil, provider.NewRegistry(adapter), cipher, memory.NewLockStore())
+	failed, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionMissing, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Failed != 1 || failed.Created != 0 {
+		t.Fatalf("expected permanent convert failure, got %#v", failed)
+	}
+	blocked, err := repo.Get(ctx, webAccount.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.BuildConvertBlockedAt == nil || blocked.BuildConvertBlockedReason != "invalid_grant" {
+		t.Fatalf("expected blocked mark, got %#v", blocked)
+	}
+	// Default convert should skip blocked account.
+	skipped, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionMissing, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped.Skipped != 1 || skipped.Failed != 0 || adapter.calls.Load() != 1 {
+		t.Fatalf("expected skip without retry, got %#v calls=%d", skipped, adapter.calls.Load())
+	}
+	// Force should attempt again (still fails with same adapter).
+	forced, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionMissing, true, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.Failed != 1 || adapter.calls.Load() != 2 {
+		t.Fatalf("expected forced retry failure, got %#v calls=%d", forced, adapter.calls.Load())
+	}
+	// Success with force clears the mark.
+	adapter.err = nil
+	adapter.succeed = true
+	ok, err := service.ConvertWebAccountsToBuildWithStrategy(ctx, []uint64{webAccount.ID}, BuildConversionMissing, true, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok.Created != 1 {
+		t.Fatalf("expected force success create, got %#v", ok)
+	}
+	cleared, err := repo.Get(ctx, webAccount.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.BuildConvertBlockedAt != nil {
+		t.Fatalf("expected block cleared, got %#v", cleared)
+	}
+}
+
+type buildConversionFailAdapter struct {
+	calls   atomic.Int64
+	err     error
+	succeed bool
+}
+
+func (a *buildConversionFailAdapter) Provider() accountdomain.Provider { return accountdomain.ProviderWeb }
+
+func (a *buildConversionFailAdapter) ConvertToBuild(_ context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	call := a.calls.Add(1)
+	if a.err != nil && !a.succeed {
+		return provider.CredentialSeed{}, a.err
+	}
+	return provider.CredentialSeed{
+		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "build", UserID: credential.SourceKey,
+		SourceKey: fmt.Sprintf("converted-block:%s:%d", credential.SourceKey, call), OIDCClientID: "client",
 		AccessToken: fmt.Sprintf("access-%d", call), RefreshToken: fmt.Sprintf("refresh-%d", call), ExpiresAt: time.Now().UTC().Add(time.Hour),
 	}, nil
 }

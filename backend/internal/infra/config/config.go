@@ -26,7 +26,7 @@ const (
 	ClearanceModeFlareSolverr     = "flaresolverr"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
 	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
-	RecommendedBuildClientVersion = "0.2.110"
+	RecommendedBuildClientVersion = "0.2.111"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
 
 	maxServerBodyBytes    = 256 << 20
@@ -204,12 +204,31 @@ type RoutingConfig struct {
 	StickyTTL                 Duration `yaml:"stickyTTL"`
 	CooldownBase              Duration `yaml:"cooldownBase"`
 	CooldownMax               Duration `yaml:"cooldownMax"`
-	CapacityWait              Duration `yaml:"capacityWait"`
-	MaxAttempts               int      `yaml:"maxAttempts"`
-	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
+	CapacityWait Duration `yaml:"capacityWait"`
+	// StickyCapacityWait is how long a sticky session waits on its bound account
+	// before temporary borrow. Zero means use capacityWait. Under high gate load
+	// the selector shortens this wait automatically to avoid convoy latency.
+	StickyCapacityWait Duration `yaml:"stickyCapacityWait"`
+	// MinAccountConcurrent floors each account's MaxConcurrent at claim time.
+	// Free Build accounts are often imported as 1; under multi-agent sessions that
+	// forces sticky borrow and cold prompt cache. 0 disables the floor (use account value).
+	MinAccountConcurrent int `yaml:"minAccountConcurrent"`
+	// MaxAttempts is how many different accounts a single request may try.
+	MaxAttempts int `yaml:"maxAttempts"`
+	// RetryStatusCodes lists upstream HTTP statuses that trigger account rotation.
+	// Empty keeps legacy defaults: 402, 403, 429, and all 5xx.
+	RetryStatusCodes []int `yaml:"retryStatusCodes"`
+	// MaxSameFingerprint stops retrying after N identical non-account failures (default 2).
+	MaxSameFingerprint int  `yaml:"maxSameFingerprint"`
+	PreferFreeBuild    bool `yaml:"preferFreeBuild"`
 	SegmentedSelectorEnabled  bool     `yaml:"segmentedSelectorEnabled"`
 	SegmentedMinCandidates    int      `yaml:"segmentedSelectorMinCandidates"`
 	SegmentedWindowSize       int      `yaml:"segmentedSelectorWindowSize"`
+	// ReadyRingEnabled enables O(window) round-robin claim without full-pool scoring.
+	// Intended for large build pools (tens of thousands) under high concurrent load.
+	ReadyRingEnabled       bool `yaml:"readyRingEnabled"`
+	ReadyRingMinCandidates int  `yaml:"readyRingMinCandidates"`
+	ReadyRingWindowSize    int  `yaml:"readyRingWindowSize"`
 	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
@@ -308,10 +327,25 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	cfg.applyReadyRingDefaults()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// applyReadyRingDefaults fills zero ready-ring fields after YAML decode.
+// A present routing: block can zero int fields that were set by defaultConfig();
+// bool ReadyRingEnabled intentionally stays as decoded (defaultConfig sets true,
+// but an explicit routing section without the key yields false — set it in YAML
+// or rely on defaultConfig when routing is omitted entirely).
+func (c *Config) applyReadyRingDefaults() {
+	if c.Routing.ReadyRingMinCandidates == 0 {
+		c.Routing.ReadyRingMinCandidates = 64
+	}
+	if c.Routing.ReadyRingWindowSize == 0 {
+		c.Routing.ReadyRingWindowSize = 64
+	}
 }
 
 func resolveRelativePaths(cfg *Config, configPath string) error {
@@ -529,10 +563,28 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
 		return errors.New("routing 配置无效")
 	}
+	if stickyWait := c.Routing.StickyCapacityWait.Value(); stickyWait < 0 || stickyWait > 5*time.Second {
+		return errors.New("routing.stickyCapacityWait 必须在 0 到 5 秒之间（0 表示沿用 capacityWait）")
+	}
+	if c.Routing.MinAccountConcurrent < 0 || c.Routing.MinAccountConcurrent > 256 {
+		return errors.New("routing.minAccountConcurrent 必须在 0 到 256 之间（0 表示不抬升）")
+	}
+	if c.Routing.MaxSameFingerprint < 0 || c.Routing.MaxSameFingerprint > 10 {
+		return errors.New("routing.maxSameFingerprint 必须在 0 到 10 之间（0 表示使用默认 2）")
+	}
+	for _, code := range c.Routing.RetryStatusCodes {
+		if code < 400 || code > 599 {
+			return errors.New("routing.retryStatusCodes 只能包含 400–599 的 HTTP 状态码")
+		}
+	}
 	if c.Routing.SegmentedMinCandidates < 100 || c.Routing.SegmentedMinCandidates > 1000000 ||
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
 		return errors.New("routing segmented selector 配置无效")
+	}
+	if c.Routing.ReadyRingMinCandidates < 8 || c.Routing.ReadyRingMinCandidates > 1000000 ||
+		c.Routing.ReadyRingWindowSize < 4 || c.Routing.ReadyRingWindowSize > 512 {
+		return errors.New("routing ready ring 配置无效")
 	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
@@ -614,7 +666,7 @@ func defaultConfig() Config {
 		Server: ServerConfig{
 			Listen:                "127.0.0.1:8000",
 			MaxBodyBytes:          32 << 20,
-			MaxConcurrentRequests: 1024,
+			MaxConcurrentRequests: 384,
 			ReadTimeout:           Duration(15 * time.Minute),
 			RequestTimeout:        Duration(2 * time.Hour),
 		},
@@ -652,8 +704,9 @@ func defaultConfig() Config {
 			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute)},
 		},
 		Batch: BatchConfig{
-			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
-			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
+			ImportConcurrency: 10, ConversionConcurrency: 10, SyncConcurrency: 10,
+			// Keep OAuth background refresh mild so it does not convoy live inference under load.
+			RefreshConcurrency: 4, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{
 			Driver: "local", MaxImageBytes: 32 << 20, MaxTotalBytes: 1 << 30,
@@ -665,11 +718,18 @@ func defaultConfig() Config {
 			CooldownBase:              Duration(30 * time.Second),
 			CooldownMax:               Duration(30 * time.Minute),
 			CapacityWait:              Duration(500 * time.Millisecond),
+			StickyCapacityWait:        Duration(time.Second), // CPA-like: brief wait then borrow without rebind
+			MinAccountConcurrent:      4,                    // floor free accounts imported as max_concurrent=1
 			MaxAttempts:               3,
+			RetryStatusCodes:          nil, // legacy: 402/403/429/5xx
+			MaxSameFingerprint:        2,
 			PreferFreeBuild:           false,
 			SegmentedSelectorEnabled:  false,
 			SegmentedMinCandidates:    3000,
 			SegmentedWindowSize:       64,
+			ReadyRingEnabled:          true,
+			ReadyRingMinCandidates:    64,
+			ReadyRingWindowSize:       64,
 			ReasoningReplayEnabled:    true,
 			ReasoningReplayTTL:        Duration(time.Hour),
 			ReasoningReplayMaxEntries: 10240,

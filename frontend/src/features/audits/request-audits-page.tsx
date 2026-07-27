@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Info, Minimize2, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, Database, Info, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
 import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -190,33 +190,39 @@ export function RequestAuditsPage() {
         {auditsQuery.isError ? <ErrorState message={auditsQuery.error.message} onRetry={() => void auditsQuery.refetch()} /> : null}
         {result && result.items.length === 0 ? <EmptyState /> : null}
         {auditsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table viewportRows={20} rowHeight={72} aria-busy={auditsQuery.isFetching} className={cn("min-w-[1136px] table-fixed text-xs transition-opacity", auditsQuery.isPlaceholderData && "pointer-events-none opacity-60")}>
+          <Table viewportRows={22} rowHeight={64} aria-busy={auditsQuery.isFetching} className={cn("min-w-[1680px] w-full table-fixed text-xs transition-opacity", auditsQuery.isPlaceholderData && "pointer-events-none opacity-60")}>
             <colgroup>
-              <col className="w-36" />
-              <col className="w-44" />
-              <col className="w-20" />
-              <col className="w-24" />
-              <col className="w-76" />
-              <col className="w-20" />
-              <col className="w-20" />
-              <col className="w-44" />
+              <col className="w-[9%]" />
+              <col className="w-[11%]" />
+              <col className="w-[16%]" />
+              <col className="w-[7%]" />
+              <col className="w-[12%]" />
+              <col className="w-[6%]" />
+              <col className="w-[8%]" />
+              <col className="w-[8%]" />
+              <col className="w-[7%]" />
+              <col className="w-[6%]" />
+              <col className="w-[10%]" />
             </colgroup>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
+                <SortableTableHead field="createdAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.createdAt")}</SortableTableHead>
                 <SortableTableHead field="request" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.request")}</SortableTableHead>
+                <TableHead>{t("audits.account")}</TableHead>
                 <SortableTableHead field="model" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("audits.model")}</SortableTableHead>
-                <TableHead>{t("audits.egress")}</TableHead>
-                <SortableTableHead field="billing" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.billing")}</SortableTableHead>
-                <SortableTableHead field="tokens" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" className="px-3" onSort={changeSort}>{t("audits.tokens")}</SortableTableHead>
+                <SortableTableHead field="tokens" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.tokens")}</SortableTableHead>
                 <SortableTableHead field="status" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort}>{t("audits.status")}</SortableTableHead>
                 <SortableTableHead field="duration" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.duration")}</SortableTableHead>
-                <SortableTableHead field="createdAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.createdAt")}</SortableTableHead>
+                <SortableTableHead field="ttft" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.ttft")}</SortableTableHead>
+                <SortableTableHead field="tps" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.tps")}</SortableTableHead>
+                <TableHead className="text-center">{t("audits.upstreamAttempts")}</TableHead>
+                <TableHead>{t("audits.egress")}</TableHead>
               </TableRow>
             </TableHeader>
             {auditsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={8} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={11} /></TableBody>
             ) : (
-              <VirtualTableBody items={result?.items ?? []} colSpan={8} rowHeight={72} overscan={6} renderRow={renderAuditRow} />
+              <VirtualTableBody items={result?.items ?? []} colSpan={11} rowHeight={64} overscan={8} renderRow={renderAuditRow} />
             )}
           </Table>
         ) : null}
@@ -227,23 +233,40 @@ export function RequestAuditsPage() {
 }
 
 const AuditRow = memo(function AuditRow({ audit, locale, onOpen }: { audit: AuditDTO; locale: string; onOpen: (audit: AuditDTO) => void }) {
+  const ttft = audit.ttftMs ?? 0;
+  const tps = audit.tokensPerSecond ?? 0;
+  const attempts = Math.max(audit.upstreamAttempts ?? 0, audit.attemptCount ?? 0, 1);
   return (
-    <TableRow className="h-[72px]">
+    <TableRow className="h-[64px]">
+      <TableCell className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">{formatDateTime(audit.createdAt, locale)}</TableCell>
       <TableCell><RequestValue audit={audit} /></TableCell>
       <TableCell>
-        <ModelRouteValue
-          model={audit.modelPublicId || `#${audit.modelRouteId}`}
-          upstreamModel={audit.modelUpstreamModel || "-"}
+        <AccountValue
           account={audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-")}
+          accountId={audit.accountId}
           clientKey={audit.clientKeyName || `#${audit.clientKeyId}`}
+          accountRequests={audit.accountRequestCount ?? 0}
+          accountSuccesses={audit.accountSuccessCount ?? 0}
+          accountFailures={audit.accountFailureCount ?? 0}
         />
       </TableCell>
-      <TableCell><EgressValue audit={audit} /></TableCell>
-      <TableCell><BillingValue audit={audit} /></TableCell>
-      <TableCell className="px-3"><UsageDetails audit={audit} locale={locale} /></TableCell>
+      <TableCell>
+        <div className="min-w-0">
+          <span className="block truncate text-xs font-medium" title={audit.modelPublicId || undefined}>{audit.modelPublicId || `#${audit.modelRouteId}`}</span>
+          <span className="mt-0.5 block truncate text-[10px] text-muted-foreground" title={audit.modelUpstreamModel || undefined}>{audit.modelUpstreamModel || "-"}</span>
+        </div>
+      </TableCell>
+      <TableCell><TokenCompact audit={audit} locale={locale} /></TableCell>
       <TableCell className="text-center"><AuditStatus audit={audit} onOpen={() => onOpen(audit)} /></TableCell>
-      <TableCell className="whitespace-nowrap text-xs tabular-nums">{formatDuration(audit.durationMs)}</TableCell>
-      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(audit.createdAt, locale)}</TableCell>
+      <TableCell className="whitespace-nowrap text-xs font-medium tabular-nums">{formatDuration(audit.durationMs)}</TableCell>
+      <TableCell className="whitespace-nowrap text-xs tabular-nums">
+        {ttft > 0 ? formatDuration(ttft) : <span className="text-muted-foreground">-</span>}
+      </TableCell>
+      <TableCell className="whitespace-nowrap text-xs tabular-nums">
+        {tps > 0 ? `${formatNumber(tps, locale, 1)} t/s` : <span className="text-muted-foreground">-</span>}
+      </TableCell>
+      <TableCell className="text-center text-xs tabular-nums"><AttemptsValue audit={audit} attempts={attempts} /></TableCell>
+      <TableCell><EgressValue audit={audit} /></TableCell>
     </TableRow>
   );
 });
@@ -281,30 +304,6 @@ function EgressValue({ audit }: { audit: AuditDTO }) {
         {details ? <div className="mt-1 text-primary-foreground/65">{details}</div> : null}
       </TooltipContent>
     </Tooltip>
-  );
-}
-
-function BillingValue({ audit }: { audit: AuditDTO }) {
-  const { t } = useTranslation();
-  const upstreamReported = audit.costInUsdTicks > 0;
-  const priced = upstreamReported || Boolean(audit.pricingModel);
-  const ticks = upstreamReported ? audit.costInUsdTicks : audit.estimatedCostInUsdTicks;
-  const amount = priced ? formatUSDCost(ticks, 2) : "-";
-  const fullAmount = priced ? formatUSDCost(ticks, 10) : "";
-  return (
-    <div className="max-w-full text-left">
-      {priced ? (
-        <Tooltip>
-          <TooltipTrigger asChild><span className="block cursor-help whitespace-nowrap text-xs tabular-nums" tabIndex={0}>{amount}</span></TooltipTrigger>
-          <TooltipContent side="top"><span className="text-primary-foreground/65">{t("audits.exactBilling")}</span> <span className="font-mono">{fullAmount}</span></TooltipContent>
-        </Tooltip>
-      ) : <span className="block text-xs text-muted-foreground">-</span>}
-      {audit.numServerSideToolsUsed > 0 ? (
-        <span className="mt-0.5 block whitespace-nowrap text-[10px] text-muted-foreground">
-          {t("audits.serverTools", { count: audit.numServerSideToolsUsed })}
-        </span>
-      ) : null}
-    </div>
   );
 }
 
@@ -346,94 +345,98 @@ function AuditTokenMetric({ icon: Icon, label, value, loading }: { icon: LucideI
   );
 }
 
-function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: string; upstreamModel: string; account: string; clientKey: string }) {
+function AccountValue({
+  account, accountId, clientKey, accountRequests, accountSuccesses, accountFailures,
+}: {
+  account: string; accountId?: string; clientKey: string;
+  accountRequests: number; accountSuccesses: number; accountFailures: number; locale?: string;
+}) {
   const { t } = useTranslation();
+  const hasStats = accountRequests > 0;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button type="button" className="block w-full min-w-0 cursor-help text-left" aria-label={t("audits.routeDetails")}>
-          <span className="block truncate text-xs font-medium" title={model}>{model}</span>
-          <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
-            <CornerDownRight className="size-3 shrink-0" />
-            <span className="truncate" title={upstreamModel}>{upstreamModel}</span>
-          </span>
+          <span className="block truncate text-xs font-medium" title={account}>{account}</span>
+          {hasStats ? (
+            <span className="mt-0.5 block truncate text-[10px] tabular-nums text-muted-foreground">
+              {t("audits.accountStatsAsOf", { success: accountSuccesses, failed: accountFailures, total: accountRequests })}
+            </span>
+          ) : (
+            <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{clientKey}</span>
+          )}
         </button>
       </TooltipTrigger>
-      <TooltipContent className="w-64 space-y-1.5 py-2" side="top" align="start">
+      <TooltipContent className="w-80 space-y-1.5 py-2" side="top" align="start">
         <div className="grid grid-cols-[auto_1fr] gap-x-3">
           <span className="text-primary-foreground/65">{t("audits.owningAccount")}</span>
           <span className="truncate text-right" title={account}>{account}</span>
+        </div>
+        {accountId ? (
+          <div className="grid grid-cols-[auto_1fr] gap-x-3">
+            <span className="text-primary-foreground/65">ID</span>
+            <span className="text-right font-mono tabular-nums">#{accountId}</span>
+          </div>
+        ) : null}
+        <div className="grid grid-cols-[auto_1fr] gap-x-3">
+          <span className="text-primary-foreground/65">{t("audits.accountStatsAsOfHint")}</span>
+          <span className="text-right tabular-nums">{t("audits.accountStatsDetail", { total: accountRequests, success: accountSuccesses, failed: accountFailures })}</span>
         </div>
         <div className="grid grid-cols-[auto_1fr] gap-x-3">
           <span className="text-primary-foreground/65">{t("audits.owningKey")}</span>
           <span className="truncate text-right" title={clientKey}>{clientKey}</span>
         </div>
+        <div className="text-[11px] text-primary-foreground/65">{t("audits.accountStatsAsOfNote")}</div>
       </TooltipContent>
     </Tooltip>
   );
 }
 
-function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
+function AttemptsValue({ audit, attempts }: { audit: AuditDTO; attempts: number }) {
   const { t } = useTranslation();
-  if (audit.operation === "compaction" && audit.totalTokens === 0) {
-    return (
-      <div className="flex h-[52px] w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-[11px]">
-        <Minimize2 className="size-3.5 shrink-0 text-muted-foreground" />
-        <div className="min-w-0">
-          <p className="truncate font-medium">{t("audits.operations.compaction")}</p>
-          <p className="truncate text-muted-foreground">{t("audits.compactionUsageUnavailable")}</p>
-        </div>
-      </div>
-    );
-  }
-  if (audit.operation === "video") {
-    return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.secondsCount", { count: audit.mediaOutputSeconds })} />;
-  }
-  // Image generation/edit APIs only show media counts. Conversation requests that
-  // happen to include input images still need the normal token breakdown.
-  if (audit.operation === "image" || audit.operation === "image_edit") {
-    return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.imageCount", { count: audit.mediaOutputImages })} />;
-  }
-  const items = [
-    { label: t("audits.input"), value: audit.inputTokens },
-    { label: t("audits.output"), value: audit.outputTokens },
-    { label: t("audits.cached"), value: audit.cachedInputTokens },
-    { label: t("audits.reasoning"), value: audit.reasoningTokens },
-  ];
   return (
-    <div className="w-full">
-      <div className="grid grid-cols-2 gap-1">
-        {items.map((item) => (
-          <div key={item.label} className="flex h-6 min-w-0 items-center justify-between gap-2 rounded-md bg-muted/45 px-2 text-[11px]">
-            <span className="text-muted-foreground">{item.label}</span>
-            <span className="font-medium tabular-nums">{formatNumber(item.value, locale)}</span>
-          </div>
-        ))}
-      </div>
-      {(audit.mediaInputImages > 0 || audit.mediaOutputImages > 0 || audit.numSourcesUsed > 0) ? (
-        <div className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
-          {audit.mediaInputImages > 0 ? <span>{t("audits.mediaInput")}: {t("audits.imageCount", { count: audit.mediaInputImages })}</span> : null}
-          {audit.mediaOutputImages > 0 ? <span>{t("audits.output")}: {t("audits.imageCount", { count: audit.mediaOutputImages })}</span> : null}
-          {audit.numSourcesUsed > 0 ? <span>{t("audits.sources", { count: audit.numSourcesUsed })}</span> : null}
-        </div>
-      ) : null}
-    </div>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="cursor-help tabular-nums">{attempts}</button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-72 space-y-1 py-2" side="top">
+        <div>{t("audits.upstreamAttempts")}: {audit.upstreamAttempts ?? 0}</div>
+        <div>{t("audits.failedAttempts")}: {audit.attemptCount ?? 0}</div>
+        <div>{t("audits.selection")}: {formatDuration(audit.selectionMs ?? 0)} · {t("audits.credential")}: {formatDuration(audit.credentialMs ?? 0)}</div>
+        <div>{t("audits.firstHeaders")}: {formatDuration(audit.firstHeadersMs ?? 0)} · {t("audits.upstreamWait")}: {formatDuration(audit.upstreamWaitMs ?? 0)}</div>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
-function MediaUsage({ input, output }: { input: string; output: string }) {
+function TokenCompact({ audit, locale }: { audit: AuditDTO; locale: string }) {
   const { t } = useTranslation();
+  if (audit.operation === "image" || audit.operation === "image_edit") {
+    return <span className="text-xs tabular-nums">{t("audits.imageCount", { count: audit.mediaOutputImages })}</span>;
+  }
+  if (audit.operation === "video") {
+    return <span className="text-xs tabular-nums">{t("audits.secondsCount", { count: audit.mediaOutputSeconds })}</span>;
+  }
   return (
-    <div className="grid w-full gap-1">
-      <div className="flex h-6 items-center justify-between gap-3 rounded-md bg-muted/45 px-2 text-[11px]">
-        <span className="text-muted-foreground">{t("audits.mediaInput")}</span>
-        <span className="font-medium tabular-nums">{input}</span>
-      </div>
-      <div className="flex h-6 items-center justify-between gap-3 rounded-md bg-muted/45 px-2 text-[11px]">
-        <span className="text-muted-foreground">{t("audits.output")}</span>
-        <span className="font-medium tabular-nums">{output}</span>
-      </div>
-    </div>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="block min-w-0 max-w-full cursor-help text-left">
+          <span className="block text-xs font-medium tabular-nums">{formatNumber(audit.totalTokens, locale, 0)}</span>
+          <span className="mt-0.5 block truncate text-[10px] tabular-nums text-muted-foreground">
+            ↑{formatNumber(audit.inputTokens, locale, 0)} ↓{formatNumber(audit.outputTokens, locale, 0)}
+            {audit.reasoningTokens > 0 ? ` · R${formatNumber(audit.reasoningTokens, locale, 0)}` : ""}
+            {audit.cachedInputTokens > 0 ? ` · C${formatNumber(audit.cachedInputTokens, locale, 0)}` : ""}
+          </span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="space-y-1 py-2" side="top">
+        <div>{t("audits.input")}: {formatNumber(audit.inputTokens, locale, 0)}</div>
+        <div>{t("audits.output")}: {formatNumber(audit.outputTokens, locale, 0)}</div>
+        <div>{t("audits.cached")}: {formatNumber(audit.cachedInputTokens, locale, 0)}</div>
+        <div>{t("audits.reasoning")}: {formatNumber(audit.reasoningTokens, locale, 0)}</div>
+        <div>{t("audits.total")}: {formatNumber(audit.totalTokens, locale, 0)}</div>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 

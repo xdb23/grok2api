@@ -154,8 +154,16 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 	}
 	_ = response.Body.Close()
 	input := captured["input"].([]any)
-	if captured["model"] != "grok-4.5" || captured["prompt_cache_key"] != "isolated-key" || len(input) != 1 || input[0].(map[string]any)["type"] != "reasoning" || input[0].(map[string]any)["encrypted_content"] != "cipher" {
-		t.Fatalf("captured = %#v", captured)
+	expectedKey, err := grokSessionID("isolated-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured["model"] != "grok-4.5" || captured["prompt_cache_key"] != expectedKey || len(input) != 1 || input[0].(map[string]any)["type"] != "reasoning" || input[0].(map[string]any)["encrypted_content"] != "cipher" {
+		t.Fatalf("captured = %#v want prompt_cache_key=%s", captured, expectedKey)
+	}
+	tools, _ := captured["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "x_search" {
+		t.Fatalf("cache route tools = %#v, want [x_search]", tools)
 	}
 }
 
@@ -232,12 +240,12 @@ func TestForwardResponseReplaysReasoningAcrossMessagesTurns(t *testing.T) {
 		}
 		switch requestCount {
 		case 2:
-			expectedSessionID, err := grokSessionID(payload.PromptCacheKey)
+			expectedSessionID, err := grokSessionID("messages-cache-key")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if payload.PromptCacheKey != "messages-cache-key" || request.Header.Get("x-grok-session-id") != expectedSessionID || len(payload.Input) != 1 || payload.Input[0]["role"] != "user" {
-				t.Fatalf("WebSearch replay isolation = key %q input %#v", payload.PromptCacheKey, payload.Input)
+			if payload.PromptCacheKey != expectedSessionID || request.Header.Get("x-grok-session-id") != expectedSessionID || len(payload.Input) != 1 || payload.Input[0]["role"] != "user" {
+				t.Fatalf("WebSearch replay isolation = key %q want %q input %#v", payload.PromptCacheKey, expectedSessionID, payload.Input)
 			}
 		case 3:
 			if len(payload.Input) != 4 || payload.Input[0]["role"] != "user" || payload.Input[1]["type"] != "reasoning" || payload.Input[1]["encrypted_content"] != replayEncrypted || payload.Input[2]["role"] != "assistant" || payload.Input[3]["role"] != "user" {
@@ -765,12 +773,16 @@ func TestForwardResponsePreservesClaudeCodeMessagesOptions(t *testing.T) {
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload["instructions"] != "legacy system" || payload["store"] != false || payload["reasoning"].(map[string]any)["effort"] != "high" || payload["prompt_cache_key"] != "messages-cache-key" {
-			t.Fatalf("upstream payload = %#v", payload)
-		}
 		expectedSessionID, err := grokSessionID("messages-cache-key")
 		if err != nil {
 			t.Fatal(err)
+		}
+		if payload["instructions"] != "legacy system" || payload["store"] != false || payload["reasoning"].(map[string]any)["effort"] != "high" || payload["prompt_cache_key"] != expectedSessionID {
+			t.Fatalf("upstream payload = %#v want prompt_cache_key=%s", payload, expectedSessionID)
+		}
+		tools, _ := payload["tools"].([]any)
+		if len(tools) != 1 || tools[0].(map[string]any)["type"] != "x_search" {
+			t.Fatalf("cache route tools = %#v", tools)
 		}
 		if request.Header.Get("x-grok-conv-id") != expectedSessionID || request.Header.Get("x-grok-session-id") != expectedSessionID {
 			t.Fatalf("prompt cache headers = %#v", request.Header)
@@ -910,8 +922,9 @@ func TestForwardResponseInjectsPromptCacheKeyAfterChatConversion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if payload["prompt_cache_key"] != "chat-cache-key" || request.Header.Get("x-grok-conv-id") != expectedSessionID || request.Header.Get("x-grok-session-id") != expectedSessionID {
-			t.Fatalf("prompt cache request: payload=%#v headers=%#v", payload, request.Header)
+		// Body key and conv-id header must be the same normalized session id (CPA dual-write).
+		if payload["prompt_cache_key"] != expectedSessionID || request.Header.Get("x-grok-conv-id") != expectedSessionID || request.Header.Get("x-grok-session-id") != expectedSessionID {
+			t.Fatalf("prompt cache request: payload=%#v headers=%#v want session=%q", payload, request.Header, expectedSessionID)
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/json"}},

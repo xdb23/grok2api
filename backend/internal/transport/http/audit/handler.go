@@ -61,8 +61,18 @@ type auditResponse struct {
 	ContextInputTokens      int64     `json:"contextInputTokens"`
 	ContextOutputTokens     int64     `json:"contextOutputTokens"`
 	DurationMS              int64     `json:"durationMs"`
+	TTFTMS                  int64     `json:"ttftMs"`
+	FirstHeadersMS          int64     `json:"firstHeadersMs"`
+	SelectionMS             int64     `json:"selectionMs"`
+	CredentialMS            int64     `json:"credentialMs"`
+	UpstreamWaitMS          int64     `json:"upstreamWaitMs"`
+	UpstreamAttempts        int       `json:"upstreamAttempts"`
+	TokensPerSecond         float64   `json:"tokensPerSecond"`
 	ErrorCode               string    `json:"errorCode,omitempty"`
 	AttemptCount            int       `json:"attemptCount"`
+	AccountRequestCount     int64     `json:"accountRequestCount"`
+	AccountSuccessCount     int64     `json:"accountSuccessCount"`
+	AccountFailureCount     int64     `json:"accountFailureCount"`
 	CreatedAt               time.Time `json:"createdAt"`
 }
 
@@ -264,6 +274,11 @@ func newListFilter(c *gin.Context) auditapp.ListFilter {
 }
 
 func newAuditResponse(value auditdomain.Record) auditResponse {
+	tps := value.TokensPerSecond
+	// Legacy rows predate timing columns: estimate TPS from total duration when possible.
+	if tps <= 0 {
+		tps = auditdomain.ComputeTokensPerSecond(value.OutputTokens, value.ReasoningTokens, value.DurationMS, value.TTFTMS)
+	}
 	return auditResponse{
 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
@@ -277,6 +292,11 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 		EstimatedCostInUSDTicks: value.EstimatedCostInUSDTicks, PricingModel: value.PricingModel, PricingVersion: value.PricingVersion,
 		NumSourcesUsed: value.NumSourcesUsed, NumServerSideToolsUsed: value.NumServerSideToolsUsed,
 		ContextInputTokens: value.ContextInputTokens, ContextOutputTokens: value.ContextOutputTokens, DurationMS: value.DurationMS,
-		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount, CreatedAt: value.CreatedAt,
+		TTFTMS: value.TTFTMS, FirstHeadersMS: value.FirstHeadersMS, SelectionMS: value.SelectionMS,
+		CredentialMS: value.CredentialMS, UpstreamWaitMS: value.UpstreamWaitMS, UpstreamAttempts: value.UpstreamAttempts,
+		TokensPerSecond: tps,
+		ErrorCode: value.ErrorCode, AttemptCount: value.AttemptCount,
+		AccountRequestCount: value.AccountRequestCount, AccountSuccessCount: value.AccountSuccessCount, AccountFailureCount: value.AccountFailureCount,
+		CreatedAt: value.CreatedAt,
 	}
 }

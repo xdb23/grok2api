@@ -13,8 +13,9 @@ func TestExtractPromptCacheSeedSupportsClaudeCodeForms(t *testing.T) {
 		body    string
 		want    string
 	}{
-		{name: "claude header", headers: http.Header{"X-Claude-Code-Session-Id": {"claude-session"}, "X-Session-Id": {"generic-session"}}, body: `{"metadata":{"session_id":"body-session"}}`, want: "claude:claude-session:agent:main"},
-		{name: "claude agent header", headers: http.Header{"X-Claude-Code-Session-Id": {"claude-session"}, "X-Claude-Code-Agent-Id": {"agent-7"}}, want: "claude:claude-session:agent:agent-7"},
+		{name: "claude header", headers: http.Header{"X-Claude-Code-Session-Id": {"claude-session"}, "X-Session-Id": {"generic-session"}}, body: `{"metadata":{"session_id":"body-session"}}`, want: "claude:claude-session"},
+		// Agent id must NOT split cache/sticky — same session stays on one account like CPA.
+		{name: "claude agent header ignored for seed", headers: http.Header{"X-Claude-Code-Session-Id": {"claude-session"}, "X-Claude-Code-Agent-Id": {"agent-7"}}, want: "claude:claude-session"},
 		{name: "codex turn prompt cache", headers: http.Header{"X-Codex-Turn-Metadata": {`{"prompt_cache_key":"codex-cache","window_id":"window-1"}`}}, want: "codex-cache"},
 		{name: "codex turn window", headers: http.Header{"X-Codex-Turn-Metadata": {`{"window_id":"window-1"}`}}, want: "codex:window:window-1"},
 		{name: "codex window header", headers: http.Header{"X-Codex-Window-Id": {"window-2"}}, want: "codex:window:window-2"},
@@ -23,8 +24,8 @@ func TestExtractPromptCacheSeedSupportsClaudeCodeForms(t *testing.T) {
 		{name: "underscore session header", headers: http.Header{"Session_id": {"underscore-session"}}, want: "underscore-session"},
 		{name: "metadata snake case", body: `{"metadata":{"session_id":"snake-session"}}`, want: "snake-session"},
 		{name: "metadata camel case", body: `{"metadata":{"sessionId":"camel-session"}}`, want: "camel-session"},
-		{name: "embedded json user id", body: `{"metadata":{"user_id":"{\"device_id\":\"d1\",\"session_id\":\"embedded-session\"}"}}`, want: "claude:embedded-session:agent:main"},
-		{name: "suffix user id", body: `{"metadata":{"user_id":"user_account_session_123e4567-e89b-12d3-a456-426614174000"}}`, want: "claude:123e4567-e89b-12d3-a456-426614174000:agent:main"},
+		{name: "embedded json user id", body: `{"metadata":{"user_id":"{\"device_id\":\"d1\",\"session_id\":\"embedded-session\"}"}}`, want: "claude:embedded-session"},
+		{name: "suffix user id", body: `{"metadata":{"user_id":"user_account_session_123e4567-e89b-12d3-a456-426614174000"}}`, want: "claude:123e4567-e89b-12d3-a456-426614174000"},
 		{name: "conversation snake case", body: `{"conversation_id":"conversation-session"}`, want: "conversation-session"},
 		{name: "conversation camel case", body: `{"conversationId":"camel-conversation"}`, want: "camel-conversation"},
 		{name: "body prompt_cache_key", body: `{"prompt_cache_key":"client-session"}`, want: "client-session"},
@@ -34,8 +35,14 @@ func TestExtractPromptCacheSeedSupportsClaudeCodeForms(t *testing.T) {
 		// http.Header canonicalizes "session_id" to Session-Id.
 		{name: "compatible client session_id via Set", headers: func() http.Header { h := make(http.Header); h.Set("session_id", "client-header-session"); return h }(), want: "client-header-session"},
 		{name: "grok conv header", headers: http.Header{"X-Grok-Conv-Id": {"grok-conv-session"}}, want: "grok-conv-session"},
+		{name: "prompt cache key header", headers: http.Header{"X-Prompt-Cache-Key": {"hdr-cache-key"}}, want: "hdr-cache-key"},
+		{name: "top-level chat id", body: `{"chat_id":"chat-abc"}`, want: "chat:chat-abc"},
 		{name: "per request id ignored", headers: http.Header{"X-Client-Request-Id": {"request-123"}}, want: ""},
 		{name: "ordinary user id", body: `{"metadata":{"user_id":"user-123"}}`, want: ""},
+		{name: "metadata conversation_id", body: `{"metadata":{"conversation_id":"meta-conversation"}}`, want: "meta-conversation"},
+		{name: "metadata thread_id", body: `{"metadata":{"thread_id":"thread-abc"}}`, want: "thread-abc"},
+		{name: "top-level user", body: `{"user":"stable-user-01"}`, want: "user:stable-user-01"},
+		{name: "short top-level user ignored", body: `{"user":"ab"}`, want: ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

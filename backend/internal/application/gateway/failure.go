@@ -28,9 +28,15 @@ type UpstreamFailure struct {
 	FreeQuotaExhausted     bool
 	ModelQuotaExhausted    bool
 	CredentialRejected     bool
-	Fingerprint            string
-	RetryAfter             time.Duration
-	Cause                  error
+	// PlatformBusy is a transient upstream capacity signal (not free-usage).
+	// Do not cool the account; may still rotate to another account.
+	PlatformBusy bool
+	// RequestScoped failures are about this prompt/content (e.g. safety policy).
+	// Do not cool the account, refresh OAuth, or rotate accounts.
+	RequestScoped bool
+	Fingerprint   string
+	RetryAfter    time.Duration
+	Cause         error
 }
 
 func (e *UpstreamFailure) Error() string {
@@ -114,6 +120,14 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
+		if isContentSafetyRejection(metadataText, upstreamCode) {
+			// Request-level safety / policy: fail this prompt only (aligns with upstream #781 intent).
+			failure.RequestScoped = true
+			failure.AccountScoped = false
+			failure.Code = "upstream_content_policy"
+			failure.PublicMessage = "上游认为内容不符合使用规范"
+			break
+		}
 		failure.AccountBlocked = isDefinitiveAccountBlock(metadataText)
 		failure.PermanentAccountDenial = isPermanentAccountDenial(metadataText)
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
@@ -124,10 +138,18 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 	case http.StatusTooManyRequests:
 		failure.Code = "upstream_rate_limited"
 		failure.PublicMessage = "上游请求频率受限"
-		failure.AccountScoped = true
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
 		failure.FreeQuotaExhausted = failure.ModelQuotaExhausted || isFreeQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
+		// Platform capacity (qg 0.3.25+): do not treat as free-usage or cool the account.
+		if !failure.QuotaExhausted && isPlatformCapacityBusy(metadataText, upstreamCode) {
+			failure.PlatformBusy = true
+			failure.AccountScoped = false
+			failure.Code = "upstream_capacity"
+			failure.PublicMessage = "上游当前繁忙，请稍后重试"
+			break
+		}
+		failure.AccountScoped = true
 	default:
 		failure.Code = "upstream_server_error"
 		failure.PublicMessage = "上游服务暂时异常"
@@ -208,6 +230,37 @@ func isFreeQuotaExhaustion(text string) bool {
 
 func isModelQuotaExhaustion(text string) bool {
 	return strings.Contains(text, "used all the included free usage for model")
+}
+
+// isPlatformCapacityBusy mirrors cpa-xai-quota-guard 0.3.25: overloaded / high demand
+// must not cool free-usage accounts. Explicit free-usage signals win over capacity.
+func isPlatformCapacityBusy(text, upstreamCode string) bool {
+	if isFreeQuotaExhaustion(text) {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(upstreamCode))
+	if code == "resource-exhausted" || strings.Contains(code, "resource_exhausted") {
+		return true
+	}
+	return containsAny(text,
+		"resource-exhausted", "resource_exhausted",
+		"at capacity", "high demand", "overloaded", "over load", "temporarily unavailable",
+		"server is busy", "try again later", "capacity",
+	)
+}
+
+// isContentSafetyRejection identifies prompt/content policy failures that must not
+// rotate accounts or invalidate OAuth (see upstream draft #781).
+func isContentSafetyRejection(text, upstreamCode string) bool {
+	code := strings.ToLower(strings.TrimSpace(upstreamCode))
+	if strings.Contains(code, "safety_check") || strings.HasPrefix(code, "safety_") {
+		return true
+	}
+	return containsAny(text,
+		"safety_check_type", "safety-check", "content violates usage guidelines",
+		"violates usage guidelines", "content policy", "usage guidelines",
+		"disallowed content", "unsafe content",
+	)
 }
 
 func containsAny(text string, signals ...string) bool {

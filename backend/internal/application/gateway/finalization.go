@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	finalizationHealthBudget    = 750 * time.Millisecond
-	finalizationOwnershipBudget = 1500 * time.Millisecond
-	finalizationQuotaBudget     = time.Second
-	finalizationAuditBudget     = 3 * time.Second
-	finalizationMetadataBudget  = 500 * time.Millisecond
+	finalizationHealthBudget    = 500 * time.Millisecond
+	finalizationOwnershipBudget = 750 * time.Millisecond // best-effort; miss only hurts previous_response_id pin
+	finalizationQuotaBudget     = 750 * time.Millisecond
+	finalizationAuditBudget     = 2 * time.Second
+	finalizationMetadataBudget  = 400 * time.Millisecond
 )
 
 type finalizationBudget struct {

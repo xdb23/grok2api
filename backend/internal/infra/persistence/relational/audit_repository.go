@@ -357,7 +357,10 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		EstimatedCostInUSDTicks: nonNegative(value.EstimatedCostInUSDTicks), PricingModel: truncate(value.PricingModel, 100), PricingVersion: truncate(value.PricingVersion, 20),
 		NumSourcesUsed: nonNegative(value.NumSourcesUsed), NumServerSideToolsUsed: nonNegative(value.NumServerSideToolsUsed),
 		ContextInputTokens: nonNegative(value.ContextInputTokens), ContextOutputTokens: nonNegative(value.ContextOutputTokens), DurationMS: nonNegative(value.DurationMS),
-		ErrorCode: truncate(value.ErrorCode, 100), AttemptCount: len(value.Attempts), CreatedAt: value.CreatedAt,
+		TTFTMS: nonNegative(value.TTFTMS), FirstHeadersMS: nonNegative(value.FirstHeadersMS), SelectionMS: nonNegative(value.SelectionMS),
+		CredentialMS: nonNegative(value.CredentialMS), UpstreamWaitMS: nonNegative(value.UpstreamWaitMS),
+		UpstreamAttempts: nonNegativeInt(value.UpstreamAttempts), TokensPerSecond: nonNegativeFloat(value.TokensPerSecond),
+		ErrorCode: truncate(value.ErrorCode, 100), AttemptCount: attemptCountOrLen(value.AttemptCount, len(value.Attempts)), CreatedAt: value.CreatedAt,
 	}
 	attempts := make([]requestAuditAttemptModel, 0, len(value.Attempts))
 	for _, attempt := range value.Attempts {
@@ -526,6 +529,30 @@ func nonNegative(value int64) int64 {
 	return value
 }
 
+func nonNegativeInt(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func nonNegativeFloat(value float64) float64 {
+	if value < 0 || value != value { // NaN
+		return 0
+	}
+	return value
+}
+
+func attemptCountOrLen(explicit, length int) int {
+	if explicit > 0 {
+		return explicit
+	}
+	if length > 0 {
+		return length
+	}
+	return 0
+}
+
 func (r *AuditRepository) SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error) {
 	result := make(map[uint64]int64, len(accountIDs))
 	if len(accountIDs) == 0 {
@@ -588,6 +615,96 @@ func (r *AuditRepository) Get(ctx context.Context, id uint64) (audit.Record, err
 	return value, nil
 }
 
+// AccountRequestStats returns lifetime and calendar-day (UTC) request success/failure counts.
+func (r *AuditRepository) AccountRequestStats(ctx context.Context, accountIDs []uint64) (map[uint64]audit.AccountRequestStats, error) {
+	result := make(map[uint64]audit.AccountRequestStats, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return result, nil
+	}
+	todayStart := time.Now().UTC().Truncate(24 * time.Hour)
+	var rows []struct {
+		AccountID      uint64
+		Requests       int64
+		Successes      int64
+		TodayRequests  int64
+		TodaySuccesses int64
+	}
+	// Success matches gateway finalize: 2xx and empty error_code (soft stream failures stay failures).
+	successCase := `CASE WHEN status_code >= 200 AND status_code < 300 AND (error_code IS NULL OR error_code = '') THEN 1 ELSE 0 END`
+	err := r.db.db.WithContext(ctx).
+		Model(&requestAuditModel{}).
+		Select(fmt.Sprintf(`account_id,
+			COUNT(*) AS requests,
+			COALESCE(SUM(%s), 0) AS successes,
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_requests,
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN %s ELSE 0 END), 0) AS today_successes`, successCase, successCase), todayStart, todayStart).
+		Where("account_id IN ?", accountIDs).
+		Group("account_id").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		failures := row.Requests - row.Successes
+		if failures < 0 {
+			failures = 0
+		}
+		todayFailures := row.TodayRequests - row.TodaySuccesses
+		if todayFailures < 0 {
+			todayFailures = 0
+		}
+		result[row.AccountID] = audit.AccountRequestStats{
+			AccountID: row.AccountID, Requests: row.Requests, Successes: row.Successes, Failures: failures,
+			TodayRequests: row.TodayRequests, TodaySuccesses: row.TodaySuccesses, TodayFailures: todayFailures,
+		}
+	}
+	for _, id := range accountIDs {
+		if _, ok := result[id]; !ok {
+			result[id] = audit.AccountRequestStats{AccountID: id}
+		}
+	}
+	return result, nil
+}
+
+// AccountRequestStatsAsOf returns per-audit running totals for the account up to and including that row.
+// Keyed by audit ID so list rows for the same account still show distinct cumulative counts.
+func (r *AuditRepository) AccountRequestStatsAsOf(ctx context.Context, auditIDs []uint64) (map[uint64]audit.AccountRequestStats, error) {
+	result := make(map[uint64]audit.AccountRequestStats, len(auditIDs))
+	if len(auditIDs) == 0 {
+		return result, nil
+	}
+	var rows []struct {
+		AuditID   uint64
+		AccountID uint64
+		Requests  int64
+		Successes int64
+	}
+	// Correlated aggregate is fine for a page-sized IN list with idx_audits_account_created_id.
+	err := r.db.db.WithContext(ctx).Raw(`
+		SELECT a.id AS audit_id, a.account_id AS account_id,
+			COUNT(b.id) AS requests,
+			COALESCE(SUM(CASE WHEN b.status_code >= 200 AND b.status_code < 300 AND (b.error_code IS NULL OR b.error_code = '') THEN 1 ELSE 0 END), 0) AS successes
+		FROM request_audits a
+		INNER JOIN request_audits b ON b.account_id = a.account_id
+			AND (b.created_at < a.created_at OR (b.created_at = a.created_at AND b.id <= a.id))
+		WHERE a.id IN ? AND a.account_id IS NOT NULL
+		GROUP BY a.id, a.account_id
+	`, auditIDs).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		failures := row.Requests - row.Successes
+		if failures < 0 {
+			failures = 0
+		}
+		result[row.AuditID] = audit.AccountRequestStats{
+			AccountID: row.AccountID, Requests: row.Requests, Successes: row.Successes, Failures: failures,
+		}
+	}
+	return result, nil
+}
+
 // ListCursor 使用“排序值 + ID”复合游标读取审计，避免深分页和同值记录漏读。
 func (r *AuditRepository) ListCursor(ctx context.Context, input repository.AuditCursorQuery) ([]audit.Record, bool, error) {
 	query := r.db.db.WithContext(ctx).Model(&requestAuditModel{})
@@ -600,6 +717,8 @@ func (r *AuditRepository) ListCursor(ctx context.Context, input repository.Audit
 		"status":    {expression: "request_audits.status_code"},
 		"mode":      {expression: "CASE WHEN request_audits.streaming = TRUE THEN 1 ELSE 0 END"},
 		"duration":  {expression: "request_audits.duration_ms", defaultDirection: repository.SortDescending},
+		"ttft":      {expression: "request_audits.ttft_ms", defaultDirection: repository.SortDescending},
+		"tps":       {expression: "request_audits.tokens_per_second", defaultDirection: repository.SortDescending},
 		"createdAt": {expression: "request_audits.created_at", defaultDirection: repository.SortDescending},
 	}
 	fallback := sortSpec{expression: "request_audits.created_at", defaultDirection: repository.SortDescending}

@@ -296,14 +296,17 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	auditService.SetCommitObserver(clientKeyService.CompleteBillingBatch)
 	auditService.SetDropObserver(clientKeyService.ReleaseBillingProtectionBatch)
 	dashboardService := dashboardapp.NewService(dashboardRepo)
-	selector := gateway.NewSelector(accountRepo, concurrency, sticky, providers, cfg.Routing.StickyTTL.Value(), cfg.Routing.CooldownBase.Value(), cfg.Routing.CooldownMax.Value(), cfg.Routing.CapacityWait.Value())
+	selector := gateway.NewSelector(accountRepo, concurrency, sticky, providers, cfg.Routing.StickyTTL.Value(), cfg.Routing.CooldownBase.Value(), cfg.Routing.CooldownMax.Value(), cfg.Routing.CapacityWait.Value(), cfg.Routing.StickyCapacityWait.Value())
 	selector.UpdatePreferFreeBuild(cfg.Routing.PreferFreeBuild)
+	selector.UpdateMinAccountConcurrent(cfg.Routing.MinAccountConcurrent)
 	selector.UpdateSegmentedSelector(cfg.Routing.SegmentedSelectorEnabled, cfg.Routing.SegmentedMinCandidates, cfg.Routing.SegmentedWindowSize)
+	selector.UpdateReadyRing(cfg.Routing.ReadyRingEnabled, cfg.Routing.ReadyRingMinCandidates, cfg.Routing.ReadyRingWindowSize)
 	invalidationService := invalidationapp.NewService(invalidationBus, invalidationSourceInstance(cfg), selector.ApplyInvalidation, logger)
 	accountRepo.SetInvalidationObserver(invalidationService.Notify)
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
+	gatewayService.UpdateRetryPolicy(cfg.Routing.RetryStatusCodes, cfg.Routing.MaxSameFingerprint)
 	gatewayService.UpdateBuildForbiddenReauthPolicy(cfg.Accounts.MarkBuildForbiddenReauth, cfg.Accounts.BuildForbiddenReauthCodes)
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -311,6 +314,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
+	// CPA-like load shedding: shorten sticky waits when the inference gate is busy so one
+	// saturated account cannot convoy every concurrent session into multi-second waits.
+	selector.SetLoadFactor(inferenceConcurrency.Load)
 	var notifySettings func(context.Context)
 	if settingsBus != nil {
 		notifySettings = func(notifyCtx context.Context) {
@@ -344,11 +350,14 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		mediaService.UpdateConfig(mediaConfig(next))
 		quotaRecoveryService.UpdateConfig(next.Provider.Web.RecoveryBackoffBase.Value(), next.Provider.Web.RecoveryBackoffMax.Value())
 		accountSyncService.UpdateConcurrency(next.Batch.ImportConcurrency)
-		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
+		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value(), next.Routing.StickyCapacityWait.Value())
 		selector.UpdatePreferFreeBuild(next.Routing.PreferFreeBuild)
+		selector.UpdateMinAccountConcurrent(next.Routing.MinAccountConcurrent)
 		selector.UpdateSegmentedSelector(next.Routing.SegmentedSelectorEnabled, next.Routing.SegmentedMinCandidates, next.Routing.SegmentedWindowSize)
+		selector.UpdateReadyRing(next.Routing.ReadyRingEnabled, next.Routing.ReadyRingMinCandidates, next.Routing.ReadyRingWindowSize)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
+		gatewayService.UpdateRetryPolicy(next.Routing.RetryStatusCodes, next.Routing.MaxSameFingerprint)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
 		auditService.UpdateWriterConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value(), next.Audit.CommitDelay.Value())
 		auditService.UpdateLedgerConfig(auditLedgerConfig(next.Audit))
@@ -526,6 +535,10 @@ func (a *Application) Run(ctx context.Context) error {
 	})
 	startBackground("statsig_warmup", func(taskCtx context.Context) error {
 		a.runStatsigWarmup(taskCtx)
+		return nil
+	})
+	startBackground("selector_prewarm", func(taskCtx context.Context) error {
+		a.runSelectorPrewarm(taskCtx)
 		return nil
 	})
 	startBackground("web_quota_startup_catchup", func(taskCtx context.Context) error {

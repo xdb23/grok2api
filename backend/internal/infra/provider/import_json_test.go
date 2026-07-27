@@ -31,8 +31,18 @@ func TestDecodeCredentialJSONEntriesReportsMalformedLineWithoutContent(t *testin
 	}
 }
 
+func TestDecodeCredentialJSONEntriesAcceptsTopLevelArray(t *testing.T) {
+	values, err := DecodeCredentialJSONEntries[credentialJSONTestEntry]([]byte(`[{"token":"one"},{"token":"two"}]`), "grok_test", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].Token != "one" || values[1].Token != "two" {
+		t.Fatalf("values = %#v", values)
+	}
+}
+
 func TestDecodeCredentialJSONEntriesRejectsNonObjects(t *testing.T) {
-	for _, data := range []string{`[{"token":"one"}]`, `"token"`, `null`} {
+	for _, data := range []string{`"token"`, `null`} {
 		if _, err := DecodeCredentialJSONEntries[credentialJSONTestEntry]([]byte(data), "grok_test", 10); err == nil || !strings.Contains(err.Error(), "必须是 JSON 对象") {
 			t.Fatalf("data = %s, error = %v", data, err)
 		}

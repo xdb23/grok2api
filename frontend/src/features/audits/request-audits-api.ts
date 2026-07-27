@@ -41,8 +41,18 @@ export type AuditDTO = {
   contextInputTokens: number;
   contextOutputTokens: number;
   durationMs: number;
+  ttftMs?: number;
+  firstHeadersMs?: number;
+  selectionMs?: number;
+  credentialMs?: number;
+  upstreamWaitMs?: number;
+  upstreamAttempts?: number;
+  tokensPerSecond?: number;
   errorCode?: string;
   attemptCount: number;
+  accountRequestCount?: number;
+  accountSuccessCount?: number;
+  accountFailureCount?: number;
   createdAt: string;
 };
 
@@ -119,7 +129,13 @@ const auditValidator = hasShape({
   cachedInputTokens: isNumber, outputTokens: isNumber, reasoningTokens: isNumber, totalTokens: isNumber,
   costInUsdTicks: isNumber, estimatedCostInUsdTicks: isNumber, pricingModel: isOptional(isString), pricingVersion: isOptional(isString),
   numSourcesUsed: isNumber, numServerSideToolsUsed: isNumber, contextInputTokens: isNumber, contextOutputTokens: isNumber,
-  durationMs: isNumber, errorCode: isOptional(isString), attemptCount: isNumber, createdAt: isString,
+  durationMs: isNumber,
+  ttftMs: isOptional(isNumber), firstHeadersMs: isOptional(isNumber), selectionMs: isOptional(isNumber),
+  credentialMs: isOptional(isNumber), upstreamWaitMs: isOptional(isNumber), upstreamAttempts: isOptional(isNumber),
+  tokensPerSecond: isOptional(isNumber),
+  errorCode: isOptional(isString), attemptCount: isNumber,
+  accountRequestCount: isOptional(isNumber), accountSuccessCount: isOptional(isNumber), accountFailureCount: isOptional(isNumber),
+  createdAt: isString,
 });
 const auditAttemptValidator = hasShape({
   id: isString, number: isNumber, source: isOneOf("upstream_http", "gateway_transport", "credential"), stage: isString,

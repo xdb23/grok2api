@@ -83,6 +83,42 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 	}
 }
 
+func TestHTTPUpstreamFailureClassifiesPlatformCapacityBusy(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		busy bool
+	}{
+		{name: "resource exhausted code", body: `{"code":"resource-exhausted","error":"at capacity"}`, busy: true},
+		{name: "high demand", body: `{"error":"The server is experiencing high demand"}`, busy: true},
+		{name: "free usage still free", body: `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok"}`, busy: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			failure := newHTTPUpstreamFailure(http.StatusTooManyRequests, []byte(test.body), 1, "a")
+			if failure.PlatformBusy != test.busy {
+				t.Fatalf("PlatformBusy=%v want %v failure=%#v", failure.PlatformBusy, test.busy, failure)
+			}
+			if test.busy && (failure.AccountScoped || failure.FreeQuotaExhausted || failure.QuotaExhausted) {
+				t.Fatalf("capacity busy must not cool account: %#v", failure)
+			}
+			if !test.busy && test.name == "free usage still free" && !failure.FreeQuotaExhausted {
+				t.Fatalf("free usage should still classify: %#v", failure)
+			}
+		})
+	}
+}
+
+func TestHTTPUpstreamFailureClassifiesContentSafetyAsRequestScoped(t *testing.T) {
+	failure := newHTTPUpstreamFailure(http.StatusForbidden, []byte(`{
+		"code":"SAFETY_CHECK_TYPE_VIOLATION",
+		"error":"Content violates usage guidelines"
+	}`), 9, "build")
+	if !failure.RequestScoped || failure.AccountScoped || failure.Code != "upstream_content_policy" {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
 func TestHTTPUpstreamFailureLeavesPaymentRecoveryKindToBilling(t *testing.T) {
 	failure := newHTTPUpstreamFailure(http.StatusPaymentRequired, []byte(`{
 		"code":"personal-team-blocked:spending-limit",

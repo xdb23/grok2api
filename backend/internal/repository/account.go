@@ -41,9 +41,11 @@ type AccountRepository interface {
 	ListEnabledAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error)
 	CountProviderAccountsByIDs(ctx context.Context, provider account.Provider, ids []uint64) (int64, error)
 	// FilterMissingBuildConversionIDs 从指定账号中排除已经关联 Build 的 Web 账号。
-	FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64) ([]uint64, error)
+	// includeBuildBlocked=false 时额外排除 build_convert_blocked 账号。
+	FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64, includeBuildBlocked bool) ([]uint64, error)
 	// ListUnlinkedWebAccountIDs 以 ID 游标取未关联 Web 账号；total 仅在 afterID 为 0 时返回。
-	ListUnlinkedWebAccountIDs(ctx context.Context, afterID uint64, limit int) ([]uint64, int64, error)
+	// includeBuildBlocked=false 时排除 build_convert_blocked 账号。
+	ListUnlinkedWebAccountIDs(ctx context.Context, afterID uint64, limit int, includeBuildBlocked bool) ([]uint64, int64, error)
 	// ListMissingConsoleSyncAccounts 从指定账号中排除已有对应 Console 账号的 Web 账号。
 	ListMissingConsoleSyncAccounts(ctx context.Context, ids []uint64) ([]account.Credential, error)
 	// ListMissingConsoleSyncBatch 以 ID 游标取缺少 Console 账号的 Web 账号；total/skipped 仅在 afterID 为 0 时返回。
@@ -81,6 +83,10 @@ type AccountRepository interface {
 	MarkWebTermsAccepted(ctx context.Context, id uint64, version int, acceptedAt time.Time) error
 	// MarkWebBirthDateSet 幂等记录 Web 账号首次确认生日已设置的时间。
 	MarkWebBirthDateSet(ctx context.Context, id uint64, setAt time.Time) error
+	// MarkWebBuildConvertBlocked 标记 Web 账号因永久原因无法转 Build（默认跳过自动转换）。
+	MarkWebBuildConvertBlocked(ctx context.Context, id uint64, reason string, blockedAt time.Time) error
+	// ClearWebBuildConvertBlocked 在 force 转换成功后清除阻断标记。
+	ClearWebBuildConvertBlocked(ctx context.Context, id uint64) error
 	UpsertModelQuotaBlock(ctx context.Context, value account.ModelQuotaBlock) error
 	PruneExpiredModelQuotaBlocks(ctx context.Context, now time.Time, limit int) (int64, error)
 	SaveBilling(ctx context.Context, value account.Billing) error
@@ -89,6 +95,10 @@ type AccountRepository interface {
 	SaveQuotaRecovery(ctx context.Context, value account.QuotaRecovery) error
 	ClaimQuotaProbe(ctx context.Context, accountID uint64, now, leaseUntil time.Time) (bool, error)
 	ClearQuotaRecovery(ctx context.Context, accountID uint64) error
+	// ResetQuotaState clears free/model quota recovery rows for the given Build accounts.
+	ResetQuotaState(ctx context.Context, provider account.Provider, accountIDs []uint64) error
+	// ResetProviderQuotaState clears recovery for all (or active-only) accounts of a provider.
+	ResetProviderQuotaState(ctx context.Context, provider account.Provider, activeOnly bool) (int64, error)
 	HasQuotaWindows(ctx context.Context, accountID uint64) (bool, error)
 	GetQuotaWindows(ctx context.Context, accountIDs []uint64) (map[uint64][]account.QuotaWindow, error)
 	ReplaceQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow) error

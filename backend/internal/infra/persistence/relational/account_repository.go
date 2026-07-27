@@ -52,7 +52,14 @@ const (
 	providerQuotaExhaustedPredicate    = `((provider_accounts.provider = 'grok_web' AND ((EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly' AND quota.remaining > 0)) OR (NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly') AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.remaining > 0)))) OR (provider_accounts.provider = 'grok_console' AND EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id) AND NOT EXISTS (SELECT 1 FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.remaining > 0)))`
 	accountTypeSortExpression          = `CASE WHEN provider_accounts.provider = 'grok_web' THEN COALESCE((SELECT profile.tier FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id), 'auto') WHEN ` + accountBuildSuperPredicate + ` THEN 'paid' WHEN ` + accountFreeSignalPredicate + ` THEN 'free' ELSE 'unknown' END`
 	accountStatusSortExpression        = `CASE WHEN provider_accounts.enabled = FALSE THEN 4 WHEN provider_accounts.auth_status = 'reauthRequired' THEN 5 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 3 WHEN EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + ` THEN 2 WHEN provider_accounts.cooldown_until > CURRENT_TIMESTAMP THEN 1 ELSE 0 END`
-	missingConsoleAccountPredicate     = `NOT EXISTS (SELECT 1 FROM provider_accounts AS console_account WHERE console_account.provider = ? AND console_account.source_key = ('console-' || provider_accounts.source_key))`
+	// Remaining-ish score: higher is more capacity left (used for quota column sort).
+	accountQuotaSortExpression = `CASE
+		WHEN provider_accounts.provider = 'grok_web' THEN COALESCE((SELECT quota.remaining FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id AND quota.mode = 'weekly' LIMIT 1), -1)
+		WHEN provider_accounts.provider = 'grok_console' THEN COALESCE((SELECT MAX(quota.remaining) FROM account_quota_windows quota WHERE quota.account_id = provider_accounts.id), -1)
+		ELSE COALESCE((SELECT CASE WHEN billing.monthly_limit > 0 THEN billing.monthly_limit - billing.used ELSE 0 END FROM account_billing_snapshots billing WHERE billing.account_id = provider_accounts.id), 0)
+	END`
+	missingConsoleAccountPredicate = `NOT EXISTS (SELECT 1 FROM provider_accounts AS console_account WHERE console_account.provider = ? AND console_account.source_key = ('console-' || provider_accounts.source_key))`
+	webBuildConvertBlockedPredicate = `EXISTS (SELECT 1 FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id AND profile.build_convert_blocked_at IS NOT NULL)`
 )
 
 func (r *AccountRepository) List(ctx context.Context, input repository.AccountListQuery) ([]account.Credential, int64, error) {
@@ -107,11 +114,13 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 	}
 	var rows []accountModel
 	query = applyStableSort(query, input.Page.Sort, map[string]sortSpec{
-		"name":      {expression: "LOWER(provider_accounts.name)"},
-		"type":      {expression: accountTypeSortExpression},
-		"status":    {expression: accountStatusSortExpression},
-		"createdAt": {expression: "provider_accounts.created_at", defaultDirection: repository.SortDescending},
-	}, sortSpec{expression: "provider_accounts.created_at", defaultDirection: repository.SortDescending}, "provider_accounts.id")
+		"name":       {expression: "LOWER(provider_accounts.name)"},
+		"type":       {expression: accountTypeSortExpression},
+		"status":     {expression: accountStatusSortExpression},
+		"quota":      {expression: accountQuotaSortExpression, defaultDirection: repository.SortDescending},
+		"lastUsedAt": {expression: "provider_accounts.last_used_at", defaultDirection: repository.SortDescending, nullsLast: true},
+		"createdAt":  {expression: "provider_accounts.created_at", defaultDirection: repository.SortDescending},
+	}, sortSpec{expression: "provider_accounts.last_used_at", defaultDirection: repository.SortDescending, nullsLast: true}, "provider_accounts.id")
 	if err := query.Preload("Credential").Preload("WebProfile").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
@@ -189,7 +198,10 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
 func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
-	values, err := r.ListEnabled(ctx, provider)
+	// Routing snapshots intentionally skip encrypted token blobs; gateway reloads
+	// secrets with Get(id) after Acquire so multi-minute candidate caches stay valid
+	// across background OAuth refresh without re-scanning the whole pool.
+	values, err := r.listEnabled(ctx, provider, true)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +335,7 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 }
 
 func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provider account.Provider, quotaMode string) ([]account.RoutingAccountBase, error) {
-	values, err := r.ListEnabled(ctx, provider)
+	values, err := r.listEnabled(ctx, provider, true)
 	if err != nil {
 		return nil, err
 	}
@@ -446,8 +458,29 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 }
 
 func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
+	return r.listEnabled(ctx, provider, false)
+}
+
+// listEnabled loads active accounts for a provider.
+// When routingOnly is true, credential secret columns are omitted so large build
+// pools can be snapshotted for selection without reading tens of MB of tokens.
+// Callers that need secrets must accounts.Get after selecting an account id.
+func (r *AccountRepository) listEnabled(ctx context.Context, provider account.Provider, routingOnly bool) ([]account.Credential, error) {
 	var rows []accountModel
-	err := r.db.db.WithContext(ctx).Preload("Credential").Preload("WebProfile").Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Order("priority DESC, id ASC").Find(&rows).Error
+	query := r.db.db.WithContext(ctx).Preload("WebProfile")
+	if routingOnly {
+		query = query.Preload("Credential", func(db *gorm.DB) *gorm.DB {
+			return db.Select(
+				"account_id", "auth_type", "client_id",
+				"expires_at", "refresh_due_at", "last_refresh_at",
+				"refresh_failures", "last_refresh_error", "refresh_permanent", "updated_at",
+			)
+		})
+	} else {
+		query = query.Preload("Credential")
+	}
+	err := query.Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).
+		Order("priority DESC, id ASC").Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +509,7 @@ func (r *AccountRepository) ListEnabledAccountIDs(ctx context.Context, provider 
 	return ids, err
 }
 
-func (r *AccountRepository) FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64) ([]uint64, error) {
+func (r *AccountRepository) FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64, includeBuildBlocked bool) ([]uint64, error) {
 	if len(ids) == 0 {
 		return []uint64{}, nil
 	}
@@ -489,24 +522,47 @@ func (r *AccountRepository) FilterMissingBuildConversionIDs(ctx context.Context,
 	for _, id := range linkedIDs {
 		linked[id] = struct{}{}
 	}
+	blocked := map[uint64]struct{}{}
+	if !includeBuildBlocked {
+		var blockedIDs []uint64
+		if err := r.db.db.WithContext(ctx).Model(&webAccountProfileModel{}).
+			Where("account_id IN ? AND build_convert_blocked_at IS NOT NULL", ids).
+			Pluck("account_id", &blockedIDs).Error; err != nil {
+			return nil, err
+		}
+		for _, id := range blockedIDs {
+			blocked[id] = struct{}{}
+		}
+	}
 	values := make([]uint64, 0, len(ids)-len(linked))
 	for _, id := range ids {
-		if _, exists := linked[id]; !exists {
-			values = append(values, id)
+		if _, exists := linked[id]; exists {
+			continue
 		}
+		if _, exists := blocked[id]; exists {
+			continue
+		}
+		values = append(values, id)
 	}
 	return values, nil
 }
 
-func (r *AccountRepository) ListUnlinkedWebAccountIDs(ctx context.Context, afterID uint64, limit int) ([]uint64, int64, error) {
+func (r *AccountRepository) ListUnlinkedWebAccountIDs(ctx context.Context, afterID uint64, limit int, includeBuildBlocked bool) ([]uint64, int64, error) {
 	if limit < 1 {
 		return []uint64{}, 0, nil
 	}
 	query := func() *gorm.DB {
-		return r.db.db.WithContext(ctx).
+		q := r.db.db.WithContext(ctx).
 			Table("provider_accounts AS account").
 			Joins("LEFT JOIN account_provider_links AS link ON link.web_account_id = account.id").
 			Where("account.provider = ? AND link.web_account_id IS NULL", account.ProviderWeb)
+		if !includeBuildBlocked {
+			q = q.Where(`NOT EXISTS (
+				SELECT 1 FROM web_account_profiles profile
+				WHERE profile.account_id = account.id AND profile.build_convert_blocked_at IS NOT NULL
+			)`)
+		}
+		return q
 	}
 	var total int64
 	if afterID == 0 {
@@ -1127,6 +1183,66 @@ func (r *AccountRepository) MarkWebBirthDateSet(ctx context.Context, id uint64, 
 	return err
 }
 
+// MarkWebBuildConvertBlocked 记录 Web 账号因上游永久错误无法转 Build。
+// 重复标记会刷新 reason 与时间；Console 同步不受影响。
+func (r *AccountRepository) MarkWebBuildConvertBlocked(ctx context.Context, id uint64, reason string, blockedAt time.Time) error {
+	if id == 0 || blockedAt.IsZero() {
+		return fmt.Errorf("Web Build 转换阻断标记参数无效")
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "invalid_grant"
+	}
+	if len(reason) > 64 {
+		reason = reason[:64]
+	}
+	blockedAt = blockedAt.UTC()
+	err := mapError(r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var accountRow accountModel
+		if err := tx.Select("id", "provider").First(&accountRow, id).Error; err != nil {
+			return err
+		}
+		if account.Provider(accountRow.Provider) != account.ProviderWeb {
+			return fmt.Errorf("仅 Grok Web 账号支持 Build 转换阻断标记")
+		}
+		profile := webAccountProfileModel{
+			AccountID: id, Tier: string(account.WebTierAuto),
+			BuildConvertBlockedAt: &blockedAt, BuildConvertBlockedReason: reason,
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "account_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"build_convert_blocked_at", "build_convert_blocked_reason"}),
+		}).Create(&profile).Error
+	}))
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderWeb, AccountID: id})
+	}
+	return err
+}
+
+// ClearWebBuildConvertBlocked 在 force 转换成功后清除阻断标记。
+func (r *AccountRepository) ClearWebBuildConvertBlocked(ctx context.Context, id uint64) error {
+	if id == 0 {
+		return fmt.Errorf("Web Build 转换阻断清除参数无效")
+	}
+	err := mapError(r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var accountRow accountModel
+		if err := tx.Select("id", "provider").First(&accountRow, id).Error; err != nil {
+			return err
+		}
+		if account.Provider(accountRow.Provider) != account.ProviderWeb {
+			return fmt.Errorf("仅 Grok Web 账号支持 Build 转换阻断标记")
+		}
+		return tx.Model(&webAccountProfileModel{}).
+			Where("account_id = ?", id).
+			Updates(map[string]any{"build_convert_blocked_at": nil, "build_convert_blocked_reason": ""}).Error
+	}))
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderWeb, AccountID: id})
+	}
+	return err
+}
+
 func (r *AccountRepository) markWebProfileTimestamp(ctx context.Context, id uint64, column string, value time.Time) error {
 	value = value.UTC()
 	return mapError(r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -1486,6 +1602,9 @@ func applyAccountStatusFilter(query *gorm.DB, status string, now time.Time) *gor
 	switch status {
 	case "active":
 		return query.Where("enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND NOT "+providerQuotaExhaustedPredicate+" AND (cooldown_until IS NULL OR cooldown_until <= ?)", true, account.AuthStatusActive, now)
+	case "abnormal":
+		// Everything that is not currently "normal/active" for routing.
+		return query.Where("NOT (enabled = ? AND auth_status = ? AND NOT "+accountRecoveryPredicate+" AND NOT "+providerQuotaExhaustedPredicate+" AND (cooldown_until IS NULL OR cooldown_until <= ?))", true, account.AuthStatusActive, now)
 	case "disabled":
 		return query.Where("enabled = ?", false)
 	case "reauthRequired":
@@ -1531,6 +1650,10 @@ func applyWebAgreementFilter(query *gorm.DB, agreement string) *gorm.DB {
 
 func applyWebAssociationFilter(query *gorm.DB, association string) *gorm.DB {
 	switch association {
+	case "buildConvertBlocked":
+		return query.Where(webBuildConvertBlockedPredicate)
+	case "buildConvertAllowed":
+		return query.Where("NOT " + webBuildConvertBlockedPredicate)
 	case "buildLinked":
 		return query.Where(webBuildLinkedPredicate)
 	case "buildUnlinked":
@@ -1566,13 +1689,12 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 	}); err != nil {
 		return account.Credential{}, err
 	}
+	// Token-only refresh does not change routing eligibility (enabled/priority/cooldown).
+	// Do NOT publish InvalidationAccountCredentialChanged here: that wiped the entire
+	// provider candidate cache and forced every request to re-load tens of thousands of
+	// rows from SQLite, dominating selection latency (~40s+) under background refresh.
+	// Gateway rebinds secrets with Get(id) after Acquire, so stale cached tokens are fine.
 	stored, err := r.Get(ctx, id)
-	if err == nil {
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, Provider: stored.Provider, AccountID: id})
-	} else {
-		// The database write already committed; retain a broad fallback if the read-back fails.
-		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: id})
-	}
 	return stored, err
 }
 
@@ -1866,6 +1988,48 @@ func (r *AccountRepository) ClearQuotaRecovery(ctx context.Context, accountID ui
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, AccountID: accountID})
 	}
 	return err
+}
+
+func (r *AccountRepository) ResetQuotaState(ctx context.Context, provider account.Provider, accountIDs []uint64) error {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("account_id IN ?", accountIDs).Delete(&quotaRecoveryModel{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("account_id IN ? AND reason = ?", accountIDs, "model_quota_depleted").Delete(&accountModelQuotaBlockModel{}).Error
+	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, Provider: provider})
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountModelQuotaChanged, Provider: provider})
+	}
+	return err
+}
+
+func (r *AccountRepository) ResetProviderQuotaState(ctx context.Context, provider account.Provider, activeOnly bool) (int64, error) {
+	var accountCount int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		accountQuery := func() *gorm.DB {
+			query := tx.Model(&accountModel{}).Where("provider = ?", provider)
+			if activeOnly {
+				query = query.Where("enabled = ? AND auth_status = ?", true, account.AuthStatusActive)
+			}
+			return query
+		}
+		if err := accountQuery().Count(&accountCount).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("account_id IN (?)", accountQuery().Select("id")).Delete(&quotaRecoveryModel{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("account_id IN (?) AND reason = ?", accountQuery().Select("id"), "model_quota_depleted").Delete(&accountModelQuotaBlockModel{}).Error
+	})
+	if err == nil && accountCount > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, Provider: provider})
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountModelQuotaChanged, Provider: provider})
+	}
+	return accountCount, err
 }
 
 func (r *AccountRepository) HasQuotaWindows(ctx context.Context, accountID uint64) (bool, error) {

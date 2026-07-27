@@ -16,4 +16,8 @@ type AuditRepository interface {
 	ListCursor(ctx context.Context, query AuditCursorQuery) ([]audit.Record, bool, error)
 	Summarize(ctx context.Context, query AuditSummaryQuery) (audit.Summary, error)
 	SumTokensByAccountsSince(ctx context.Context, accountIDs []uint64, since time.Time) (map[uint64]int64, error)
+	// AccountRequestStats returns lifetime success/failure counts for the given account IDs.
+	AccountRequestStats(ctx context.Context, accountIDs []uint64) (map[uint64]audit.AccountRequestStats, error)
+	// AccountRequestStatsAsOf returns per-audit cumulative account stats up to that request (keyed by audit ID).
+	AccountRequestStatsAsOf(ctx context.Context, auditIDs []uint64) (map[uint64]audit.AccountRequestStats, error)
 }

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Braces, FileText, KeyRound, Network, Server, TriangleAlert } from "lucide-react";
+import { Braces, CircleCheck, FileText, KeyRound, Network, Server, TriangleAlert } from "lucide-react";
 import { useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -10,7 +10,7 @@ import { getRequestAudit, type AuditAttemptDTO, type AuditDTO } from "@/features
 import { CopyButton } from "@/shared/components/copy-button";
 import { ErrorState, LoadingState } from "@/shared/components/data-state";
 import { cn } from "@/shared/lib/cn";
-import { formatDateTime, formatNumber } from "@/shared/lib/format";
+import { formatDateTime, formatDuration, formatNumber } from "@/shared/lib/format";
 
 const AUDIT_DETAIL_CACHE_TIME_MS = 60_000;
 
@@ -67,23 +67,41 @@ export function RequestAuditDetailDialog({ audit, open, onOpenChange }: { audit:
   );
 }
 
-/** Soft failures (stream interrupt, unavailable) often have no attempt rows — still show actionable error detail. */
+/** Success rows and soft failures (no attempt snapshots) share this summary panel. */
 function AuditLevelErrorPanel({ audit }: { audit: AuditDTO }) {
   const { t, i18n } = useTranslation();
+  const ok = audit.statusCode >= 200 && audit.statusCode < 300 && !audit.errorCode;
   const summary = [
     { label: t("audits.status"), value: String(audit.statusCode || "-") },
-    { label: t("audits.errorCode"), value: audit.errorCode || t("audits.noFailureAttempts") },
+    { label: t("audits.errorCode"), value: audit.errorCode || (ok ? t("audits.statusSuccess") : t("audits.noFailureAttempts")) },
     { label: t("audits.model"), value: audit.modelPublicId || audit.modelUpstreamModel || "-" },
     { label: t("audits.account"), value: audit.accountName || (audit.accountId ? `#${audit.accountId}` : "-") },
+    {
+      label: t("audits.accountStats"),
+      value: t("audits.accountStatsDetail", {
+        total: audit.accountRequestCount ?? 0,
+        success: audit.accountSuccessCount ?? 0,
+        failed: audit.accountFailureCount ?? 0,
+      }),
+    },
     { label: t("audits.key"), value: audit.clientKeyName || (audit.clientKeyId ? `#${audit.clientKeyId}` : "-") },
-    { label: t("audits.duration"), value: `${formatNumber(audit.durationMs, i18n.language)} ms` },
+    { label: t("audits.duration"), value: formatDuration(audit.durationMs) },
+    { label: t("audits.ttft"), value: (audit.ttftMs ?? 0) > 0 ? formatDuration(audit.ttftMs ?? 0) : "-" },
+    { label: t("audits.tps"), value: (audit.tokensPerSecond ?? 0) > 0 ? `${formatNumber(audit.tokensPerSecond ?? 0, i18n.language, 1)} t/s` : "-" },
+    { label: t("audits.firstHeaders"), value: (audit.firstHeadersMs ?? 0) > 0 ? formatDuration(audit.firstHeadersMs ?? 0) : "-" },
+    { label: t("audits.selection"), value: (audit.selectionMs ?? 0) > 0 ? formatDuration(audit.selectionMs ?? 0) : "-" },
+    { label: t("audits.credential"), value: (audit.credentialMs ?? 0) > 0 ? formatDuration(audit.credentialMs ?? 0) : "-" },
+    { label: t("audits.upstreamWait"), value: (audit.upstreamWaitMs ?? 0) > 0 ? formatDuration(audit.upstreamWaitMs ?? 0) : "-" },
+    { label: t("audits.upstreamAttempts"), value: String(audit.upstreamAttempts ?? 0) },
+    { label: t("audits.tokens"), value: t("audits.tokenBreakdown", { input: audit.inputTokens, output: audit.outputTokens, cached: audit.cachedInputTokens, reasoning: audit.reasoningTokens }) },
     { label: t("audits.egress"), value: [audit.egressMode, audit.egressNodeName, audit.egressScope].filter(Boolean).join(" · ") || "-" },
+    { label: t("audits.mode"), value: audit.streaming ? t("audits.stream") : t("audits.nonStream") },
   ];
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-5 pb-5">
-      <div className="flex items-center gap-2 py-3 text-destructive">
-        <TriangleAlert className="size-4 shrink-0" />
-        <p className="min-w-0 truncate font-medium">{audit.errorCode || t("audits.noFailureAttempts")}</p>
+      <div className={cn("flex items-center gap-2 py-3", ok ? "text-emerald-700 dark:text-emerald-300" : "text-destructive")}>
+        {ok ? <CircleCheck className="size-4 shrink-0" /> : <TriangleAlert className="size-4 shrink-0" />}
+        <p className="min-w-0 truncate font-medium">{ok ? t("audits.statusSuccess") : (audit.errorCode || t("audits.noFailureAttempts"))}</p>
       </div>
       <div className="grid min-h-0 flex-1 gap-x-10 gap-y-4 overflow-y-auto sm:grid-cols-2">
         {summary.map((item) => (
@@ -93,7 +111,7 @@ function AuditLevelErrorPanel({ audit }: { audit: AuditDTO }) {
           </div>
         ))}
       </div>
-      <p className="mt-3 shrink-0 text-[11px] text-muted-foreground">{t("audits.softFailureHint")}</p>
+      {!ok ? <p className="mt-3 shrink-0 text-[11px] text-muted-foreground">{t("audits.softFailureHint")}</p> : null}
     </div>
   );
 }

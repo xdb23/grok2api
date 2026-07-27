@@ -226,18 +226,23 @@ func TestNormalizeReasoningPreservesReferenceEfforts(t *testing.T) {
 }
 
 func TestConsoleImportAcceptsJSONPlainTextAndCookieFormat(t *testing.T) {
-	values, err := parseImportedCredentials([]byte("sso=token-one; sso-rw=token-one\ntoken-two\ntoken-two\n"))
+	const (
+		ssoOne = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvbmUifQ.sigonevaluehere"
+		ssoTwo = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0d28ifQ.sigtwovaluehere"
+		ssoA   = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJjb25zb2xlLWEifQ.sigavalueherexx"
+	)
+	values, err := parseImportedCredentials([]byte("sso=" + ssoOne + "; sso-rw=" + ssoOne + "\n" + ssoTwo + "\n" + ssoTwo + "\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 2 || values[0].AccessToken != "token-one" || values[1].AccessToken != "token-two" {
+	if len(values) != 2 || values[0].AccessToken != ssoOne || values[1].AccessToken != ssoTwo {
 		t.Fatalf("plain values = %#v", values)
 	}
-	values, err = parseImportedCredentials([]byte(`{"provider":"grok_console","accounts":[{"name":"console-a","sso_token":"token-a","cloudflare_cookies":"cf_clearance=abc"}]}`))
+	values, err = parseImportedCredentials([]byte(`{"provider":"grok_console","accounts":[{"name":"console-a","sso_token":"` + ssoA + `","cloudflare_cookies":"cf_clearance=abc"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 1 || values[0].Provider != account.ProviderConsole || values[0].AuthType != account.AuthTypeSSO || values[0].Name != "console-a" || values[0].AccessToken != "token-a" {
+	if len(values) != 1 || values[0].Provider != account.ProviderConsole || values[0].AuthType != account.AuthTypeSSO || values[0].Name != "console-a" || values[0].AccessToken != ssoA {
 		t.Fatalf("json values = %#v", values)
 	}
 	if values[0].CloudflareCookies != "cf_clearance=abc" {
@@ -246,14 +251,32 @@ func TestConsoleImportAcceptsJSONPlainTextAndCookieFormat(t *testing.T) {
 }
 
 func TestConsoleImportAcceptsJSONLines(t *testing.T) {
-	data := []byte("\xef\xbb\xbf{\"name\":\"first\",\"sso_token\":\"token-one\",\"email\":\"one@example.com\"}\r\n\r\n" +
-		"{\"name\":\"second\",\"token\":\"token-two\",\"user_id\":\"user-two\"}\r\n")
+	const (
+		ssoOne = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvbmUifQ.sigonevaluehere"
+		ssoTwo = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0d28ifQ.sigtwovaluehere"
+	)
+	data := []byte("\xef\xbb\xbf{\"name\":\"first\",\"sso_token\":\"" + ssoOne + "\",\"email\":\"one@example.com\"}\r\n\r\n" +
+		"{\"name\":\"second\",\"token\":\"" + ssoTwo + "\",\"user_id\":\"user-two\"}\r\n")
 	values, err := parseImportedCredentials(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 2 || values[0].AccessToken != "token-one" || values[0].Email != "one@example.com" || values[1].AccessToken != "token-two" || values[1].UserID != "user-two" {
+	if len(values) != 2 || values[0].AccessToken != ssoOne || values[0].Email != "one@example.com" || values[1].AccessToken != ssoTwo || values[1].UserID != "user-two" {
 		t.Fatalf("credentials = %#v", values)
+	}
+}
+
+func TestConsoleImportAcceptsTopLevelArray(t *testing.T) {
+	const ssoOne = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvbmUifQ.sigonevaluehere"
+	values, err := parseImportedCredentials([]byte(`[{"name":"c","sso_token":"` + ssoOne + `"}]`))
+	if err != nil || len(values) != 1 || values[0].AccessToken != ssoOne {
+		t.Fatalf("values = %#v err = %v", values, err)
+	}
+}
+
+func TestConsoleImportRejectsJSONGarbage(t *testing.T) {
+	if _, err := parseImportedCredentials([]byte("\"name\": \"x@y.com\",\n")); err == nil {
+		t.Fatal("expected garbage rejection")
 	}
 }
 

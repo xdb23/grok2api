@@ -1,0 +1,80 @@
+# 本地开发配置模板。复制为 config.dev.yaml 后填密钥与数据路径：
+#   cp config.dev.example.yaml config.dev.yaml
+#
+# 推荐：与现网 Docker 共用 volume 数据，改完稳定后再 docker build。
+# 注意：本机 air 与容器 grok2api 不要同时写同一 SQLite。
+
+server:
+  listen: "127.0.0.1:18000"
+  maxBodyBytes: 33554432
+  readTimeout: 15m
+  requestTimeout: 2h
+  swaggerEnabled: true
+
+auth:
+  accessTokenTTL: 15m
+  refreshTokenTTL: 720h
+  secureCookies: false
+
+secrets:
+  jwtSecret: "replace-with-at-least-32-chars-secret-key!!"
+  credentialEncryptionKey: "replace-with-base64-32-byte-key===="
+
+bootstrapAdmin:
+  username: "admin"
+  password: "change-me"
+
+frontend:
+  # Vite 开发时主要走 :5173；此路径供纯 API 模式托管静态资源
+  staticPath: "./frontend/dist"
+
+database:
+  driver: sqlite
+  sqlite:
+    # 示例：挂现网 volume（按本机实际改）
+    # path: "/var/lib/docker/volumes/grok2api_grok2api-data/_data/backend.db"
+    path: "./data/backend.db"
+  postgres:
+    dsn: "postgres://user:password@127.0.0.1:5432/grok2api?sslmode=disable"
+    maxOpenConns: 50
+    maxIdleConns: 10
+
+runtimeStore:
+  driver: memory
+  redis:
+    address: "127.0.0.1:6379"
+    username: ""
+    password: ""
+    database: 0
+    keyPrefix: "grok2api:"
+    tls: false
+
+deployment:
+  replicas: 1
+  instanceID: ""
+  clusterID: "grok2api"
+  sharedMedia: false
+
+media:
+  driver: local
+  local:
+    # path: "/var/lib/docker/volumes/grok2api_grok2api-data/_data/media"
+    path: "./data/media"
+
+routing:
+  reasoningReplayEnabled: true
+  reasoningReplayTTL: 1h
+  reasoningReplayMaxEntries: 10240
+  segmentedSelectorEnabled: false
+  segmentedSelectorMinCandidates: 3000
+  segmentedSelectorWindowSize: 64
+
+audit:
+  bufferSize: 16384
+  batchSize: 256
+  flushInterval: 250ms
+  commitDelay: 5ms
+  ledgerMode: enforce
+  ledgerFailureThreshold: 1
+  ledgerUnhealthyGrace: 10s
+  ledgerQueueHighWatermarkPercent: 90

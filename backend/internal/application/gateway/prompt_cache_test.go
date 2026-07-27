@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"strings"
 	"testing"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -74,8 +75,14 @@ func TestResolveBuildSessionIdentitySoftFromMessagesIsStableAcrossTurns(t *testi
 	if first.replayKey != "" {
 		t.Fatalf("soft identity must not enable reasoning replay: %#v", first)
 	}
-	if first.upstreamID != second.upstreamID || first.affinityKey != second.affinityKey {
-		t.Fatalf("soft identity drifted across turns: first=%#v second=%#v", first, second)
+	if first.upstreamID != second.upstreamID {
+		t.Fatalf("soft upstream drifted across turns: first=%#v second=%#v", first, second)
+	}
+	// Turn2 includes assistant → dual affinity; fallback half must match turn1 affinity.
+	if second.affinityKey == first.affinityKey {
+		// ok if assistant not extracted
+	} else if !strings.Contains(second.affinityKey, first.affinityKey) {
+		t.Fatalf("turn2 dual affinity must inherit turn1 fallback: first=%#v second=%#v", first, second)
 	}
 	// Different first user messages must remain isolated.
 	other := resolveBuildSessionIdentity(7, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"messages":[{"role":"user","content":"different"}]}`))
@@ -96,15 +103,31 @@ func TestResolveBuildSessionIdentitySoftFromResponsesInput(t *testing.T) {
 	}
 }
 
-func TestResolveBuildSessionIdentityUsesInstructionsAsSystemAnchor(t *testing.T) {
-	// Responses commonly uses top-level instructions instead of messages[system].
+func TestResolveBuildSessionIdentitySoftIgnoresVolatileSystem(t *testing.T) {
+	// Coding agents rewrite instructions/system every turn; soft identity must stay on first user only.
 	a := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"instructions":"stable system","input":[{"role":"user","content":"hello"}]}`))
 	b := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"instructions":"stable system","input":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}]}`))
-	c := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"instructions":"other system","input":[{"role":"user","content":"hello"}]}`))
+	c := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"instructions":"OTHER system with date and git status","input":[{"role":"user","content":"hello"}]}`))
 	if !a.soft || a.upstreamID == "" || a.upstreamID != b.upstreamID {
-		t.Fatalf("instructions soft session unstable: %#v %#v", a, b)
+		t.Fatalf("soft session unstable across turns: %#v %#v", a, b)
 	}
-	if a.upstreamID == c.upstreamID {
-		t.Fatal("different instructions should isolate soft session")
+	// b has assistant so affinity may be dual; fallback must include a.affinityKey
+	if a.affinityKey != b.affinityKey && !strings.Contains(b.affinityKey, a.affinityKey) {
+		t.Fatalf("soft affinity lost turn1 fallback: a=%#v b=%#v", a, b)
+	}
+	if a.upstreamID != c.upstreamID {
+		t.Fatalf("volatile system must not change soft session: a=%#v c=%#v", a, c)
+	}
+	otherUser := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"instructions":"stable system","input":[{"role":"user","content":"different start"}]}`))
+	if otherUser.upstreamID == a.upstreamID {
+		t.Fatal("different first user must isolate soft session")
+	}
+}
+
+func TestResolveBuildSessionIdentitySoftNormalizesWhitespace(t *testing.T) {
+	a := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"messages":[{"role":"user","content":"hello   world\nnext"}]}`))
+	b := resolveBuildSessionIdentity(3, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte("{\"messages\":[{\"role\":\"user\",\"content\":\"hello world next\"}]}"))
+	if !a.soft || a.upstreamID == "" || a.upstreamID != b.upstreamID {
+		t.Fatalf("soft whitespace normalize failed: a=%#v b=%#v", a, b)
 	}
 }

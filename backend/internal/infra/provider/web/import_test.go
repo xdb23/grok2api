@@ -7,16 +7,21 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 )
 
+const (
+	testSSOOne = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJvbmUifQ.sigonevaluehere"
+	testSSOTwo = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0d28ifQ.sigtwovaluehere"
+)
+
 func TestParseImportedCredentialsAcceptsOneSSOTokenPerLine(t *testing.T) {
 	adapter := &Adapter{}
-	values, err := adapter.ParseImportedCredentials([]byte("token-one\nsso=token-two; other=drop\n\ntoken-one\n"))
+	values, err := adapter.ParseImportedCredentials([]byte(testSSOOne + "\nsso=" + testSSOTwo + "; other=drop\n\n" + testSSOOne + "\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(values) != 2 {
 		t.Fatalf("credentials = %#v", values)
 	}
-	if values[0].AccessToken != "token-one" || values[1].AccessToken != "token-two" {
+	if values[0].AccessToken != testSSOOne || values[1].AccessToken != testSSOTwo {
 		t.Fatalf("tokens = %q, %q", values[0].AccessToken, values[1].AccessToken)
 	}
 	for _, value := range values {
@@ -34,9 +39,34 @@ func TestParseImportedCredentialsRejectsOversizedPlainToken(t *testing.T) {
 	}
 }
 
+func TestParseImportedCredentialsRejectsJSONGarbagePlainLines(t *testing.T) {
+	adapter := &Adapter{}
+	// Historical bug: pretty-printed array lines were imported as SSO tokens.
+	garbage := "\"name\": \"xaief831eaf4d58@r03.reg.xdb23.tech\",\n" +
+		"\"sso_token\": \"" + testSSOOne + "\",\n"
+	if _, err := adapter.ParseImportedCredentials([]byte(garbage)); err == nil {
+		t.Fatal("expected JSON garbage plain lines to be rejected")
+	}
+}
+
+func TestParseImportedCredentialsAcceptsTopLevelArray(t *testing.T) {
+	adapter := &Adapter{}
+	data := []byte(`[
+  {"name":"a","sso_token":"` + testSSOOne + `","email":"a@example.com"},
+  {"name":"b","token":"` + testSSOTwo + `","tier":"super"}
+]`)
+	values, err := adapter.ParseImportedCredentials(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0].AccessToken != testSSOOne || values[0].Email != "a@example.com" || values[1].AccessToken != testSSOTwo || values[1].WebTier != account.WebTierSuper {
+		t.Fatalf("credentials = %#v", values)
+	}
+}
+
 func TestWebCredentialJSONUsesCurrentDocumentShape(t *testing.T) {
 	adapter := &Adapter{}
-	values, err := adapter.ParseImportedCredentials([]byte(`{"provider":"grok_web","accounts":[{"name":"primary","sso_token":"token-one","tier":"super","cloudflare_cookies":"cf_clearance=abc; sso=drop"}]}`))
+	values, err := adapter.ParseImportedCredentials([]byte(`{"provider":"grok_web","accounts":[{"name":"primary","sso_token":"` + testSSOOne + `","tier":"super","cloudflare_cookies":"cf_clearance=abc; sso=drop"}]}`))
 	if err != nil || len(values) != 1 || values[0].WebTier != account.WebTierSuper {
 		t.Fatalf("credentials = %#v, err = %v", values, err)
 	}
@@ -57,21 +87,29 @@ func TestWebCredentialJSONUsesCurrentDocumentShape(t *testing.T) {
 
 func TestWebCredentialJSONLinesPreserveMetadata(t *testing.T) {
 	adapter := &Adapter{}
-	data := []byte("\xef\xbb\xbf{\"name\":\"first\",\"sso_token\":\"token-one\",\"tier\":\"super\",\"email\":\"one@example.com\"}\r\n\r\n" +
-		"{\"name\":\"second\",\"token\":\"token-two\",\"user_id\":\"user-two\"}\r\n")
+	data := []byte("\xef\xbb\xbf{\"name\":\"first\",\"sso_token\":\"" + testSSOOne + "\",\"tier\":\"super\",\"email\":\"one@example.com\"}\r\n\r\n" +
+		"{\"name\":\"second\",\"token\":\"" + testSSOTwo + "\",\"user_id\":\"user-two\"}\r\n")
 	values, err := adapter.ParseImportedCredentials(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 2 || values[0].AccessToken != "token-one" || values[0].WebTier != account.WebTierSuper || values[0].Email != "one@example.com" || values[1].AccessToken != "token-two" || values[1].UserID != "user-two" {
+	if len(values) != 2 || values[0].AccessToken != testSSOOne || values[0].WebTier != account.WebTierSuper || values[0].Email != "one@example.com" || values[1].AccessToken != testSSOTwo || values[1].UserID != "user-two" {
 		t.Fatalf("credentials = %#v", values)
 	}
 }
 
 func TestWebCredentialJSONLinesRejectMalformedLine(t *testing.T) {
 	adapter := &Adapter{}
-	_, err := adapter.ParseImportedCredentials([]byte("{\"sso_token\":\"token-one\"}\ninvalid-secret\n"))
+	_, err := adapter.ParseImportedCredentials([]byte("{\"sso_token\":\"" + testSSOOne + "\"}\ninvalid-secret\n"))
 	if err == nil || !strings.Contains(err.Error(), "第 2 行") || strings.Contains(err.Error(), "invalid-secret") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWebCredentialRejectsNonJWTInJSON(t *testing.T) {
+	adapter := &Adapter{}
+	_, err := adapter.ParseImportedCredentials([]byte(`{"provider":"grok_web","accounts":[{"sso_token":"not-a-jwt-token-value-at-all"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "SSO 无效") {
 		t.Fatalf("error = %v", err)
 	}
 }

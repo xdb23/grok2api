@@ -20,6 +20,8 @@ var (
 	ErrCredentialLimit      = errors.New("credential count exceeds limit")
 	ErrUnauthorized         = errors.New("upstream credential unauthorized")
 	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
+	// ErrInvalidGrant marks a permanent OAuth token rejection (e.g. web→build convert).
+	ErrInvalidGrant = errors.New("invalid_grant")
 )
 
 // HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.

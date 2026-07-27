@@ -103,10 +103,60 @@ type Record struct {
 	ContextInputTokens      int64
 	ContextOutputTokens     int64
 	DurationMS              int64
-	ErrorCode               string
-	AttemptCount            int
-	Attempts                []Attempt
-	CreatedAt               time.Time
+	// TTFTMS is time-to-first-body (stream first token / non-stream first payload byte) from request start.
+	TTFTMS int64
+	// FirstHeadersMS is time until upstream response headers arrive.
+	FirstHeadersMS int64
+	// SelectionMS / CredentialMS / UpstreamWaitMS are gateway stage waits (may sum retries).
+	SelectionMS    int64
+	CredentialMS   int64
+	UpstreamWaitMS int64
+	// UpstreamAttempts is how many upstream HTTP calls this request made (including retries).
+	UpstreamAttempts int
+	// TokensPerSecond is completion tokens (output+reasoning) per second after TTFT.
+	// Zero means unknown / not applicable (no completion tokens or missing timing).
+	TokensPerSecond float64
+	ErrorCode       string
+	AttemptCount    int
+	Attempts        []Attempt
+	// Account*Count are lifetime request stats for AccountID (filled at read time, not persisted).
+	AccountRequestCount int64
+	AccountSuccessCount int64
+	AccountFailureCount int64
+	CreatedAt           time.Time
+}
+
+// AccountRequestStats aggregates historical request outcomes for one upstream account.
+type AccountRequestStats struct {
+	AccountID uint64
+	Requests  int64
+	Successes int64
+	Failures  int64
+	// Today* counts use the calendar day of the provided since boundary (UTC).
+	TodayRequests  int64
+	TodaySuccesses int64
+	TodayFailures  int64
+}
+
+// ComputeTokensPerSecond derives generation speed from completion tokens and post-TTFT duration.
+func ComputeTokensPerSecond(outputTokens, reasoningTokens, durationMS, ttftMS int64) float64 {
+	completion := outputTokens + reasoningTokens
+	if completion <= 0 {
+		return 0
+	}
+	generationMS := durationMS - ttftMS
+	if generationMS < 1 {
+		generationMS = durationMS
+	}
+	if generationMS < 1 {
+		return 0
+	}
+	return float64(completion) / (float64(generationMS) / 1000.0)
+}
+
+// IsSuccessful reports whether an audit row counts as a successful inference for account stats.
+func IsSuccessful(statusCode int, errorCode string) bool {
+	return statusCode >= 200 && statusCode < 300 && errorCode == ""
 }
 
 // Summary 表示指定审计范围内的聚合用量。

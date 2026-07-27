@@ -685,6 +685,10 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 			body: `data: {"type":"response.completed","response":{"id":"resp_ok","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}` + "\n\n",
 		},
 		{
+			name: "responses incomplete is terminal success", protocol: streamProtocolResponses,
+			body: `data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}` + "\n\n",
+		},
+		{
 			name: "responses eof before completed", protocol: streamProtocolResponses,
 			body:    `data: {"type":"response.created","response":{"id":"resp_cut"}}` + "\n\n",
 			wantErr: errUpstreamStreamIncomplete,
@@ -721,10 +725,102 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 			} else if metadata.StreamFailure != nil {
 				t.Fatalf("unexpected stream failure diagnostic = %#v", metadata.StreamFailure)
 			}
-			if recorder.Body.String() != test.body {
-				t.Fatalf("forwarded = %q", recorder.Body.String())
+			got := recorder.Body.String()
+			switch {
+			case test.wantErr == nil:
+				if got != test.body {
+					t.Fatalf("forwarded = %q", got)
+				}
+			case errors.Is(test.wantErr, errUpstreamStreamIncomplete):
+				// Incomplete streams keep upstream bytes and append response.failed / chat error tail.
+				if !strings.HasPrefix(got, test.body) {
+					t.Fatalf("missing upstream prefix: %q", got)
+				}
+				if test.protocol == streamProtocolResponses && !strings.Contains(got, "response.failed") {
+					t.Fatalf("expected SSE error tail, got %q", got)
+				}
+			default:
+				// Failed terminal events already include the error payload; no extra tail.
+				if got != test.body {
+					t.Fatalf("forwarded = %q", got)
+				}
 			}
 		})
+	}
+}
+
+func TestWriteResultStreamBootstrapUpstream400ReturnsJSONError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusBadRequest,
+		Status:     "400 Bad Request",
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"code":"invalid-argument","error":"Could not decrypt the provided encrypted_content."}`)),
+		Finalize: func(_ gateway.Usage, _, code string) {
+			finalCode = code
+		},
+	}
+	router := gin.New()
+	router.POST("/", func(c *gin.Context) {
+		handler.writeResult(c, result, true, streamProtocolResponses)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "text/event-stream") || strings.Contains(body, "upstream_stream_incomplete") || !strings.Contains(body, "Could not decrypt") {
+		t.Fatalf("body=%s", body)
+	}
+	if finalCode != "upstream_error" {
+		t.Fatalf("finalCode=%q", finalCode)
+	}
+	if ct := recorder.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("content-type=%q", ct)
+	}
+}
+
+func TestCopyStreamLazyStatusBootstrapIncompleteReturns502JSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	router.GET("/", func(c *gin.Context) {
+		// Empty body → EOF with no terminal event, zero bytes transferred.
+		_, transferred, err := copyStreamLazyStatus(c, strings.NewReader(""), streamProtocolResponses, http.StatusOK, false)
+		if transferred != 0 || !errors.Is(err, errUpstreamStreamIncomplete) {
+			t.Fatalf("transferred=%d err=%v", transferred, err)
+		}
+	})
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "upstream_stream_incomplete") {
+		t.Fatalf("body=%s", recorder.Body.String())
+	}
+}
+
+func TestCopyStreamLazyStatusMidStreamIncompleteInjectsSSEError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	router := gin.New()
+	partial := `data: {"type":"response.created","response":{"id":"resp_cut"}}` + "\n\n"
+	router.GET("/", func(c *gin.Context) {
+		_, transferred, err := copyStreamLazyStatus(c, strings.NewReader(partial), streamProtocolResponses, http.StatusOK, false)
+		if transferred == 0 || !errors.Is(err, errUpstreamStreamIncomplete) {
+			t.Fatalf("transferred=%d err=%v", transferred, err)
+		}
+	})
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (headers already flushed with first chunk)", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, partial) || !strings.Contains(body, "response.failed") || !strings.Contains(body, "upstream_stream_incomplete") {
+		t.Fatalf("body=%q", body)
 	}
 }
 

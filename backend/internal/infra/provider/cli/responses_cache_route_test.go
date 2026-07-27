@@ -19,10 +19,11 @@ func TestPrepareBuildPromptCacheRouteToolFree(t *testing.T) {
 		t.Fatal(err)
 	}
 	tools := payload["tools"].([]any)
-	if len(tools) != 2 || stringField(tools[0].(map[string]any), "type") != "web_search" || stringField(tools[1].(map[string]any), "type") != "x_search" {
+	// CPA-aligned: x_search only + tool_choice none.
+	if len(tools) != 1 || stringField(tools[0].(map[string]any), "type") != "x_search" {
 		t.Fatalf("tools = %#v", tools)
 	}
-	if payload["tool_choice"] != "none" || !route.filterXSearch || len(route.injectedToolTypes) != 2 {
+	if payload["tool_choice"] != "none" || !route.filterXSearch || len(route.injectedToolTypes) != 1 {
 		t.Fatalf("route = %#v payload = %#v", route, payload)
 	}
 }
@@ -58,15 +59,17 @@ func TestPrepareBuildPromptCacheRoutePreservesLargeIntegers(t *testing.T) {
 	}
 }
 
-func TestPrepareBuildPromptCacheRouteDoesNotBroadenUntrustedFunctions(t *testing.T) {
+func TestPrepareBuildPromptCacheRouteInjectsXSearchForFunctionToolsLikeCPA(t *testing.T) {
+	// CPA always injects native x_search when a cache session identity exists, including
+	// pure function-tool requests. Internal x_search subcalls are filtered on the way out.
 	body, route, err := prepareBuildPromptCacheRoute([]byte(`{
 		"input":"hello","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
 	}`), "responses", "grok-4.5", "cache-key", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), `"x_search"`) || route.filterXSearch || len(route.injectedToolTypes) != 0 {
-		t.Fatalf("untrusted function request was broadened: body=%s route=%#v", body, route)
+	if !strings.Contains(string(body), `"x_search"`) || !route.filterXSearch || len(route.injectedToolTypes) != 1 {
+		t.Fatalf("expected CPA-style x_search inject: body=%s route=%#v", body, route)
 	}
 }
 
@@ -117,6 +120,30 @@ func TestPrepareBuildPromptCacheRoutePreservesExplicitXSearch(t *testing.T) {
 	}
 	if !route.filterXSearch || len(route.injectedToolTypes) != 0 {
 		t.Fatalf("explicit x_search route = %#v", route)
+	}
+}
+
+func TestPrepareBuildPromptCacheRouteStabilizesXSearchTrailing(t *testing.T) {
+	body, route, err := prepareBuildPromptCacheRoute([]byte(`{
+		"input":"hello",
+		"tools":[{"type":"x_search"},{"type":"web_search"},{"type":"x_search"}]
+	}`), "responses", "grok-4.5", "cache-key", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools := payload["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if stringField(tools[0].(map[string]any), "type") != "web_search" || stringField(tools[1].(map[string]any), "type") != "x_search" {
+		t.Fatalf("x_search was not normalized to trailing position: %#v", tools)
+	}
+	if !route.filterXSearch {
+		t.Fatalf("route = %#v", route)
 	}
 }
 

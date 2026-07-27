@@ -92,6 +92,13 @@ routing:
   segmentedSelectorEnabled: false
   segmentedSelectorMinCandidates: 3000
   segmentedSelectorWindowSize: 64
+  # 大号池热路径：O(window) 内存 ready-ring RR，未命中再回退 segmented/full planner。
+  readyRingEnabled: true
+  readyRingMinCandidates: 64
+  readyRingWindowSize: 64
+  maxAttempts: 3
+  retryStatusCodes: [402, 403, 429, 500, 502, 503, 504]
+  maxSameFingerprint: 2
 
 audit:
   # [通常不要修改] 审计批量写入参数；bufferSize 的修改需重启生效。

@@ -178,10 +178,16 @@ type Credential struct {
 	// WebBirthDateSetAt 记录 Grok Web 上游首次确认生日已设置的时间。
 	// 该字段用于避免批量脚本重复请求不可修改的生日接口。
 	WebBirthDateSetAt *time.Time
-	LinkedAccountID   uint64
-	LinkedAccountName string
-	LinkedProvider    Provider
-	LinkedAccounts    []LinkedAccount
+	// BuildConvertBlockedAt 表示该 Web 账号曾因上游 invalid_grant 等永久原因转换 Build 失败。
+	// 自动/默认 web→build 会跳过；force 转换可重试；成功转换后清空。
+	// Console 同步不受影响。
+	BuildConvertBlockedAt *time.Time
+	// BuildConvertBlockedReason 记录最近一次阻断原因（如 invalid_grant）。
+	BuildConvertBlockedReason string
+	LinkedAccountID           uint64
+	LinkedAccountName         string
+	LinkedProvider            Provider
+	LinkedAccounts            []LinkedAccount
 	// BuildAPIFallback 仅记录 grok_build 曾因当次 Build 403 成功回退到 XAI。
 	// 它不参与路由；每个新请求仍先走 Build，只有当次严格 403 才可尝试 XAI。
 	// token refresh / SSO 转换 / 普通 upsert / 重启不得清除。

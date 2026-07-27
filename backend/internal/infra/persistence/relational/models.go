@@ -113,8 +113,11 @@ type webAccountProfileModel struct {
 	TermsAcceptedAt      *time.Time
 	TermsAcceptedVersion int `gorm:"not null;default:0"`
 	BirthDateSetAt       *time.Time
-	EgressIdentity       string        `gorm:"size:128;not null;default:'';check:chk_web_account_profiles_egress_identity,length(egress_identity) <= 128"`
-	Account              *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	// BuildConvertBlockedAt 非空时默认跳过 web→build（Console 不受影响）。
+	BuildConvertBlockedAt     *time.Time
+	BuildConvertBlockedReason string        `gorm:"size:64;not null;default:'';check:chk_web_account_profiles_build_convert_blocked_reason,length(build_convert_blocked_reason) <= 64"`
+	EgressIdentity            string        `gorm:"size:128;not null;default:'';check:chk_web_account_profiles_egress_identity,length(egress_identity) <= 128"`
+	Account                   *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (webAccountProfileModel) TableName() string { return "web_account_profiles" }
@@ -315,6 +318,13 @@ type requestAuditModel struct {
 	ContextInputTokens      int64     `gorm:"not null;default:0"`
 	ContextOutputTokens     int64     `gorm:"not null;default:0"`
 	DurationMS              int64     `gorm:"not null;default:0"`
+	TTFTMS                  int64     `gorm:"column:ttft_ms;not null;default:0"`
+	FirstHeadersMS          int64     `gorm:"column:first_headers_ms;not null;default:0"`
+	SelectionMS             int64     `gorm:"column:selection_ms;not null;default:0"`
+	CredentialMS            int64     `gorm:"column:credential_ms;not null;default:0"`
+	UpstreamWaitMS          int64     `gorm:"column:upstream_wait_ms;not null;default:0"`
+	UpstreamAttempts        int       `gorm:"column:upstream_attempts;not null;default:0"`
+	TokensPerSecond         float64   `gorm:"column:tokens_per_second;not null;default:0"`
 	ErrorCode               string    `gorm:"size:100;check:chk_request_audits_error_code,length(error_code) <= 100"`
 	AttemptCount            int       `gorm:"not null;default:0;check:chk_request_audits_attempt_count,attempt_count >= 0"`
 	CreatedAt               time.Time `gorm:"not null"`

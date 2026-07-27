@@ -44,23 +44,43 @@ func prepareBuildPromptCacheRoute(body []byte, operation, model, promptCacheKey 
 
 	// Hide upstream internal subcalls even when the client explicitly declares x_search.
 	// Cache routing itself applies only to plain-text conversations with a stable cache session identity.
+	// prompt_cache_key is account-scoped on xAI: sticky rebind after quota switch keeps the same key so
+	// the new account rebuilds cache on subsequent turns (first post-switch turn is cold).
 	if strings.TrimSpace(promptCacheKey) == "" || !isBuildCacheConversationOperation(operation) || isBuildCacheMediaModel(model) || hasBuildCacheToolType(tools, "image_generation") {
 		return body, route, nil
 	}
 
 	if len(tools) == 0 {
-		// A tool-free request uses none to select the cache-capable route without granting search capability.
-		tools = append(tools, json.RawMessage(`{"type":"web_search"}`), json.RawMessage(`{"type":"x_search"}`))
+		// Align with CPA: inject only native x_search for the Build free-tier cache path.
+		// Dual web_search+x_search changed the tools prefix vs CPA and could miss shared
+		// multi-turn cache when clients alternate tool-free / tool-bearing turns.
+		tools = append(tools, json.RawMessage(`{"type":"x_search"}`))
 		payload["tool_choice"] = mustJSON("none")
-		route.injectedToolTypes["web_search"] = struct{}{}
 		route.injectedToolTypes["x_search"] = struct{}{}
 		route.filterXSearch = true
-	} else if !hasBuildCacheToolType(tools, "x_search") && (allowClientTools || hasBuildCacheToolType(tools, "web_search")) {
-		// With client tools, add only the x_search route required by the official Build behavior and preserve
-		// the original tool_choice. Do not also expose web_search.
+	} else if !hasBuildCacheToolType(tools, "x_search") {
+		// CPA always appends x_search when cache identity exists (including pure function tools).
+		// filterXSearch hides internal subcalls. allowClientTools kept for call-site compatibility.
+		_ = allowClientTools
 		tools = append(tools, json.RawMessage(`{"type":"x_search"}`))
 		route.injectedToolTypes["x_search"] = struct{}{}
 		route.filterXSearch = true
+	} else {
+		// Already has x_search: filter internals. Only reshape when x_search is duplicated
+		// or not already the sole trailing entry — avoid thrashing a stable tools prefix.
+		route.filterXSearch = true
+		xSearchCount := 0
+		lastIsXSearch := false
+		for index, rawTool := range tools {
+			kind, _ := buildCacheToolIdentity(rawTool)
+			if kind == "x_search" {
+				xSearchCount++
+				lastIsXSearch = index == len(tools)-1
+			}
+		}
+		if xSearchCount != 1 || !lastIsXSearch {
+			tools = stabilizeBuildCacheXSearchTrailing(tools)
+		}
 	}
 	payload["tools"] = mustJSON(tools)
 	if _, injected := route.injectedToolTypes["x_search"]; injected {
@@ -138,6 +158,30 @@ func hasBuildCacheToolType(tools []json.RawMessage, kind string) bool {
 		}
 	}
 	return false
+}
+
+// stabilizeBuildCacheXSearchTrailing collapses duplicate x_search entries and moves a single
+// x_search to the end so multi-turn tool lists share a stable cache-route suffix.
+func stabilizeBuildCacheXSearchTrailing(tools []json.RawMessage) []json.RawMessage {
+	if len(tools) == 0 {
+		return tools
+	}
+	stable := make([]json.RawMessage, 0, len(tools))
+	var xSearch json.RawMessage
+	for _, rawTool := range tools {
+		kind, _ := buildCacheToolIdentity(rawTool)
+		if kind == "x_search" {
+			if len(xSearch) == 0 {
+				xSearch = rawTool
+			}
+			continue
+		}
+		stable = append(stable, rawTool)
+	}
+	if len(xSearch) == 0 {
+		return tools
+	}
+	return append(stable, xSearch)
 }
 
 func isBuildCacheConversationOperation(operation string) bool {

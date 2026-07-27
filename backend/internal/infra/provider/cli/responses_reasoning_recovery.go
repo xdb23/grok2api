@@ -104,12 +104,25 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 			a.logReasoningRecovery(request, base, "encrypted_content", "rate_limited", retry.StatusCode, nil)
 			return retry, retryURL, reasoningRecoveryOutcome{encryptedContentDowngraded: true}
 		}
+		// responseHasReasoningDecodeFailure always consumes/closes retry.Body.
 		sameDecodeFailure, inspectErr := responseHasReasoningDecodeFailure(retry)
-		if inspectErr != nil || !sameDecodeFailure {
+		if inspectErr != nil {
 			a.logReasoningRecovery(request, base, "encrypted_content", "retry_rejected", retry.StatusCode, inspectErr)
 			return original, requestURL, reasoningRecoveryOutcome{failed: true}
 		}
-		a.logReasoningRecovery(request, base, "encrypted_content", "decode_error_persisted", retry.StatusCode, nil)
+		if !sameDecodeFailure {
+			// Strip removed opaque state but upstream still rejected — often residual
+			// server-side session identity. CPA recovers by continuing without the
+			// bad session; do the same when session reset is safe instead of
+			// returning the original decrypt 400 (which surfaces to clients as a
+			// broken stream / empty-or-malformed response).
+			a.logReasoningRecovery(request, base, "encrypted_content", "retry_rejected", retry.StatusCode, nil)
+			if !canResetReasoningSession(request, portableBody) {
+				return original, requestURL, reasoningRecoveryOutcome{failed: true}
+			}
+		} else {
+			a.logReasoningRecovery(request, base, "encrypted_content", "decode_error_persisted", retry.StatusCode, nil)
+		}
 	}
 
 	if !canResetReasoningSession(request, portableBody) {
@@ -239,9 +252,11 @@ func isReasoningDecodeFailure(body []byte) bool {
 	return false
 }
 
-// stripReasoningEncryptedContent removes opaque reasoning state while
+// stripReasoningEncryptedContent removes opaque reasoning/compaction state while
 // preserving any readable summary/content. An encrypted-only reasoning item
-// becomes empty after stripping and is removed entirely.
+// becomes empty after stripping and is removed entirely. Compaction items that
+// only carry encrypted_content are dropped (CPA drops invalid compaction too) so
+// a foreign-account or stale blob cannot hard-fail the whole turn.
 func stripReasoningEncryptedContent(body []byte) ([]byte, bool) {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
@@ -255,12 +270,23 @@ func stripReasoningEncryptedContent(body []byte) ([]byte, bool) {
 	rebuilt := make([]any, 0, len(input))
 	for _, raw := range input {
 		item, ok := raw.(map[string]any)
-		if !ok || stringField(item, "type") != "reasoning" {
+		if !ok {
 			rebuilt = append(rebuilt, raw)
 			continue
 		}
-		encrypted, ok := item["encrypted_content"].(string)
-		if !ok || strings.TrimSpace(encrypted) == "" {
+		itemType := stringField(item, "type")
+		encrypted, hasEncrypted := item["encrypted_content"].(string)
+		encrypted = strings.TrimSpace(encrypted)
+		if itemType == "compaction" && hasEncrypted && encrypted != "" {
+			// Compaction blobs are not portable across accounts/sessions.
+			changed = true
+			continue
+		}
+		if itemType != "reasoning" {
+			rebuilt = append(rebuilt, raw)
+			continue
+		}
+		if !hasEncrypted || encrypted == "" {
 			rebuilt = append(rebuilt, raw)
 			continue
 		}

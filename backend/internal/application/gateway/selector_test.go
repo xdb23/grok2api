@@ -191,12 +191,32 @@ func TestSelectorQuotaRecoveryUsesBestKnownReset(t *testing.T) {
 	selector.MarkPaymentQuotaExhausted(ctx, value, quotaRecoveryHints{QuotaMode: "missing", RetryAfter: 90 * time.Minute})
 	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
 	assertRecoveryDelay(t, recovery, retryStarted, 90*time.Minute)
+	anchoredProbe := recovery.NextProbeAt.UTC()
 
+	// Soft re-mark must keep the earlier probe (qg ExhaustedAt anchor), not restart from now.
+	selector.MarkPaymentQuotaExhausted(ctx, value, quotaRecoveryHints{QuotaMode: "missing"})
+	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
+	if recovery.NextProbeAt == nil || !recovery.NextProbeAt.Equal(anchoredProbe) {
+		t.Fatalf("re-mark payment fallback moved probe: got %#v want %s", recovery, anchoredProbe)
+	}
+	selector.MarkFreeQuotaExhausted(ctx, value, 100, 100, quotaRecoveryHints{QuotaMode: "missing"})
+	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
+	if recovery.NextProbeAt == nil || !recovery.NextProbeAt.Equal(anchoredProbe) {
+		t.Fatalf("re-mark free moved probe: got %#v want %s", recovery, anchoredProbe)
+	}
+
+	// Fresh free exhaust (no prior recovery) uses the 24h soft pause.
+	if err := accounts.ClearQuotaRecovery(ctx, value.ID); err != nil {
+		t.Fatal(err)
+	}
 	fallbackStarted := time.Now().UTC()
 	selector.MarkPaymentQuotaExhausted(ctx, value, quotaRecoveryHints{QuotaMode: "missing"})
 	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
 	assertRecoveryDelay(t, recovery, fallbackStarted, paymentRequiredRecoveryPause)
 
+	if err := accounts.ClearQuotaRecovery(ctx, value.ID); err != nil {
+		t.Fatal(err)
+	}
 	freeStarted := time.Now().UTC()
 	selector.MarkFreeQuotaExhausted(ctx, value, 100, 100, quotaRecoveryHints{QuotaMode: "missing"})
 	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
@@ -260,6 +280,9 @@ func TestSelectorUsesPaidWeeklyPoolAsWebQuotaGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	selector.MarkQuotaStateChanged(account.ProviderWeb)
+	// Invalidation is stale-while-revalidate for large pools; unit tests rebuild the
+	// selector so the next Acquire must read the rewritten weekly remaining from SQLite.
+	selector = NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
 	lease, err := selector.Acquire(ctx, account.ProviderWeb, "", "fast", "", nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -668,7 +691,7 @@ func TestSelectorWaitsBrieflyForAccountCapacity(t *testing.T) {
 func TestSelectorStickySessionWaitsForBoundAccountCapacity(t *testing.T) {
 	ctx := context.Background()
 	sticky := memory.NewStickyStore()
-	selector, primary, _ := newStickySelectorFixture(t, sticky, 300*time.Millisecond, true)
+	selector, primary, _, _ := newStickySelectorFixture(t, sticky, 300*time.Millisecond, true)
 	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
 	if err != nil || first.Credential.ID != primary.ID {
 		t.Fatalf("first lease = %#v, err = %v", first, err)
@@ -702,7 +725,7 @@ func TestSelectorStickySessionWaitsForBoundAccountCapacity(t *testing.T) {
 func TestSelectorStickySessionTemporaryFallbackDoesNotRebind(t *testing.T) {
 	ctx := context.Background()
 	sticky := memory.NewStickyStore()
-	selector, primary, fallback := newStickySelectorFixture(t, sticky, 20*time.Millisecond, true)
+	selector, primary, fallback, _ := newStickySelectorFixture(t, sticky, 20*time.Millisecond, true)
 	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
 	if err != nil || first.Credential.ID != primary.ID {
 		t.Fatalf("first lease = %#v, err = %v", first, err)
@@ -723,10 +746,121 @@ func TestSelectorStickySessionTemporaryFallbackDoesNotRebind(t *testing.T) {
 	resumed.Release()
 }
 
+func TestSelectorAccountConcurrencyFloor(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, _, _ := newStickySelectorFixture(t, sticky, 0, false)
+	selector.UpdateMinAccountConcurrent(3)
+	// MaxConcurrent on fixture is 1; floor should allow 3 concurrent leases on the same account.
+	var leases []*accountLease
+	for i := 0; i < 3; i++ {
+		lease, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "", nil, false)
+		if err != nil || lease == nil || lease.Credential.ID != primary.ID {
+			t.Fatalf("lease %d = %#v err=%v", i, lease, err)
+		}
+		leases = append(leases, lease)
+	}
+	if _, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "", nil, false); err == nil {
+		t.Fatal("expected saturation after floor of 3")
+	}
+	for _, lease := range leases {
+		lease.Release()
+	}
+}
+
+func TestSelectorStickyWaitShortensUnderLoad(t *testing.T) {
+	selector := &Selector{stickyCapacityWait: 3 * time.Second, capacityWait: 200 * time.Millisecond}
+	if got := selector.stickyWaitDuration(); got != 3*time.Second {
+		t.Fatalf("idle sticky wait = %s, want 3s", got)
+	}
+	// Near gate full: still wait a little (borrow is expensive for cache).
+	selector.SetLoadFactor(func() float64 { return 0.99 })
+	if got := selector.stickyWaitDuration(); got != 200*time.Millisecond {
+		t.Fatalf("near-saturation sticky wait = %s, want 200ms", got)
+	}
+	selector.SetLoadFactor(func() float64 { return 0.92 })
+	if got := selector.stickyWaitDuration(); got != 750*time.Millisecond {
+		t.Fatalf("high-load sticky wait = %s, want 750ms", got)
+	}
+	selector.SetLoadFactor(func() float64 { return 0.85 })
+	if got := selector.stickyWaitDuration(); got != 1500*time.Millisecond {
+		t.Fatalf("busy sticky wait = %s, want 1500ms", got)
+	}
+	selector.SetLoadFactor(func() float64 { return 0.5 })
+	if got := selector.stickyWaitDuration(); got != 3*time.Second {
+		t.Fatalf("moderate-load sticky wait = %s, want full 3s", got)
+	}
+}
+
+func TestSelectorStickyExcludedDoesNotRebind(t *testing.T) {
+	// Same-request capacity rotate excludes the sticky account; sticky must stay for cache.
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, fallback, _ := newStickySelectorFixture(t, sticky, 0, true)
+	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || first.Credential.ID != primary.ID {
+		t.Fatalf("first lease = %#v, err = %v", first, err)
+	}
+	if first.StickyMode != stickyModeHit && first.StickyMode != stickyModeBind {
+		t.Fatalf("first sticky mode = %q, want hit|bind", first.StickyMode)
+	}
+	first.Release()
+	borrowed, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", map[uint64]bool{primary.ID: true}, false)
+	if err != nil || borrowed.Credential.ID != fallback.ID {
+		t.Fatalf("excluded sticky lease = %#v, err = %v", borrowed, err)
+	}
+	if borrowed.StickyMode != stickyModeBorrow || borrowed.StickyBoundID != primary.ID {
+		t.Fatalf("borrow meta = mode=%q bound=%d want borrow/%d", borrowed.StickyMode, borrowed.StickyBoundID, primary.ID)
+	}
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || !ok || boundID != primary.ID {
+		t.Fatalf("sticky rebound after request exclude: id=%d ok=%v err=%v want %d", boundID, ok, err, primary.ID)
+	}
+	borrowed.Release()
+	resumed, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || resumed.Credential.ID != primary.ID {
+		t.Fatalf("resumed sticky = %#v, err = %v", resumed, err)
+	}
+	if resumed.StickyMode != stickyModeHit {
+		t.Fatalf("resumed sticky mode = %q, want hit", resumed.StickyMode)
+	}
+	resumed.Release()
+}
+
+func TestSelectorStickyQuotaIneligibleRebinds(t *testing.T) {
+	// When the bound account is permanently ineligible, rebind so the same prompt_cache_key
+	// warms cache on the replacement account for subsequent turns.
+	// Model quota block leaves sticky intact (unlike free-quota exhaust which DeleteByAccount).
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, fallback, accounts := newStickySelectorFixture(t, sticky, 0, true)
+	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || first.Credential.ID != primary.ID {
+		t.Fatalf("first lease = %#v, err = %v", first, err)
+	}
+	first.Release()
+	selector.MarkModelQuotaExhausted(ctx, primary, "model", time.Hour)
+	// Drop process-local SWR snapshot so the model block is visible immediately.
+	fresh := NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, nil, time.Hour, time.Second, time.Minute, 0)
+	next, err := fresh.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
+	if err != nil || next.Credential.ID != fallback.ID {
+		t.Fatalf("quota rebind lease = %#v, err = %v want fallback %d", next, err, fallback.ID)
+	}
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || !ok || boundID != fallback.ID {
+		t.Fatalf("sticky after quota rebind = id=%d ok=%v err=%v want %d", boundID, ok, err, fallback.ID)
+	}
+	next.Release()
+	if err := fresh.RebindSticky(ctx, "stable-affinity", fallback.ID); err != nil {
+		t.Fatal(err)
+	}
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey("stable-affinity"), time.Now().UTC()); err != nil || !ok || boundID != fallback.ID {
+		t.Fatalf("explicit rebind = id=%d ok=%v err=%v", boundID, ok, err)
+	}
+}
+
 func TestSelectorStickyHitRefreshesTTL(t *testing.T) {
 	ctx := context.Background()
 	sticky := newRecordingStickyStore()
-	selector, _, _ := newStickySelectorFixture(t, sticky, 0, false)
+	selector, _, _, _ := newStickySelectorFixture(t, sticky, 0, false)
 	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", "stable-affinity", nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -744,7 +878,7 @@ func TestSelectorStickyHitRefreshesTTL(t *testing.T) {
 	}
 }
 
-func newStickySelectorFixture(t *testing.T, sticky repository.StickySessionRepository, capacityWait time.Duration, withFallback bool) (*Selector, account.Credential, account.Credential) {
+func newStickySelectorFixture(t *testing.T, sticky repository.StickySessionRepository, capacityWait time.Duration, withFallback bool) (*Selector, account.Credential, account.Credential, repository.AccountRepository) {
 	t.Helper()
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "sticky-selector.db"))
@@ -773,7 +907,7 @@ func newStickySelectorFixture(t *testing.T, sticky repository.StickySessionRepos
 			t.Fatal(err)
 		}
 	}
-	return NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, nil, time.Hour, time.Second, time.Minute, capacityWait), primary, fallback
+	return NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, nil, time.Hour, time.Second, time.Minute, capacityWait), primary, fallback, accounts
 }
 
 func TestSelectorAppliesPersistedCooldownOnlyToMatchingModel(t *testing.T) {

@@ -171,21 +171,21 @@ func TestAccountRepositoryLinksWebAndBuildAccountsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unlinkedIDs, total, err := repo.ListUnlinkedWebAccountIDs(ctx, 0, 1)
+	unlinkedIDs, total, err := repo.ListUnlinkedWebAccountIDs(ctx, 0, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 1 || len(unlinkedIDs) != 1 || unlinkedIDs[0] != unlinkedWeb.ID {
 		t.Fatalf("unlinked web ids = %#v, total = %d", unlinkedIDs, total)
 	}
-	nextUnlinkedIDs, nextTotal, err := repo.ListUnlinkedWebAccountIDs(ctx, unlinkedWeb.ID, 1)
+	nextUnlinkedIDs, nextTotal, err := repo.ListUnlinkedWebAccountIDs(ctx, unlinkedWeb.ID, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if nextTotal != 0 || len(nextUnlinkedIDs) != 0 {
 		t.Fatalf("next unlinked web ids = %#v, total = %d", nextUnlinkedIDs, nextTotal)
 	}
-	buildCandidates, err := repo.FilterMissingBuildConversionIDs(ctx, []uint64{web.ID, build.ID, unlinkedWeb.ID, 999_999})
+	buildCandidates, err := repo.FilterMissingBuildConversionIDs(ctx, []uint64{web.ID, build.ID, unlinkedWeb.ID, 999_999}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestFreshSchemaContract(t *testing.T) {
 	assertTableColumns(t, database, "web_account_profiles", []string{"account_id", "tier", "synced_at", "nsfw_enabled_at"}, nil)
 	assertTableColumns(t, database, "admin_sessions", nil, []string{"revoked_at"})
 	assertTableColumns(t, database, "account_model_capabilities", []string{"account_id", "upstream_model"}, []string{"provider", "synced_at"})
-	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds"}, nil)
+	assertTableColumns(t, database, "request_audits", []string{"media_input_images", "media_output_images", "media_output_seconds", "ttft_ms", "first_headers_ms", "selection_ms", "credential_ms", "upstream_wait_ms", "upstream_attempts", "tokens_per_second"}, nil)
 	assertTableColumns(t, database, "response_ownership", []string{"response_id", "account_id", "client_key_id", "provider", "prompt_cache_key", "reasoning_replay_key", "expires_at"}, []string{"parent_response_id", "model_route_id"})
 
 	var expiresNotNull int

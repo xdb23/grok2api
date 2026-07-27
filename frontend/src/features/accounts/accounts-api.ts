@@ -100,9 +100,19 @@ export type AccountDTO = {
   linkedProvider?: "grok_build" | "grok_web";
   linkedAccounts?: LinkedAccountDTO[];
   createdAt: string;
+  buildConvertBlockedAt?: string;
+  buildConvertBlockedReason?: string;
+  requestStats?: RequestStatsDTO;
   billing?: BillingDTO;
   quota: QuotaDTO;
   quotaWindows?: Array<{ mode: string; remaining: number; total: number; usagePercent: number; breakdown?: Array<{ productCode: number; usagePercent: number }>; windowSeconds: number; resetAt?: string; syncedAt?: string; source: "default" | "estimated" | "upstream" }>;
+};
+
+export type RequestStatsDTO = {
+  successTotal: number;
+  failTotal: number;
+  successToday: number;
+  failToday: number;
 };
 
 export type LinkedAccountDTO = {
@@ -186,7 +196,9 @@ const accountValidator = hasShape({
   lastRefreshErrorCode: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
   linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
-  createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
+  createdAt: isString, buildConvertBlockedAt: isOptional(isString), buildConvertBlockedReason: isOptional(isString),
+  requestStats: isOptional(hasShape({ successTotal: isNumber, failTotal: isNumber, successToday: isNumber, failToday: isNumber })),
+  billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
 });
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);
@@ -288,8 +300,8 @@ export type BuildConversionStrategy = AccountSyncStrategy;
 export type WebConsoleSyncStrategy = AccountSyncStrategy;
 
 export type BuildConversionInput =
-  | { all: true; ids?: never; strategy?: BuildConversionStrategy }
-  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy };
+  | { all: true; ids?: never; strategy?: BuildConversionStrategy; force?: boolean }
+  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy; force?: boolean };
 
 export type WebConsoleSyncInput =
   | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }

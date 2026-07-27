@@ -117,12 +117,13 @@ export function AccountsPage() {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [statusDetailFilter, setStatusDetailFilter] = useState("");
   const [egressFilter, setEgressFilter] = useState("");
   const [renewalFilter, setRenewalFilter] = useState("");
   const [riskFilter, setRiskFilter] = useState("");
   const [agreementFilter, setAgreementFilter] = useState("");
   const [associationFilter, setAssociationFilter] = useState("");
-  const [sort, setSort] = useState<TableSort>({ field: "createdAt", order: "desc" });
+  const [sort, setSort] = useState<TableSort>({ field: "lastUsedAt", order: "desc" });
   const [selection, setSelection] = useState<AccountSelection>(() => ({ provider: "grok_build", ids: new Set() }));
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [egressBindingOpen, setEgressBindingOpen] = useState(false);
@@ -135,6 +136,7 @@ export function AccountsPage() {
   const [webConversionTargets, setWebConversionTargets] = useState<string[] | "all" | null>(null);
   const [webConversionTarget, setWebConversionTarget] = useState<WebConversionTarget>("build");
   const [webConversionStrategy, setWebConversionStrategy] = useState<BuildConversionStrategy>("missing");
+  const [webConversionForce, setWebConversionForce] = useState(false);
   const [conversionProgress, setConversionProgress] = useState<BuildConversionProgressState | null>(null);
   const [webConsoleSyncProgress, setWebConsoleSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [webAccountScriptsTargets, setWebAccountScriptsTargets] = useState<string[] | "all" | null>(null);
@@ -186,10 +188,11 @@ export function AccountsPage() {
   const buildRouteMode = useWatch({ control: form.control, name: "buildRouteMode" });
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
 
+  const effectiveStatusFilter = statusFilter === "abnormal" && statusDetailFilter ? statusDetailFilter : statusFilter;
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
+    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, statusDetailFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
     queryFn: () => listAccounts({
-      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
+      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: effectiveStatusFilter, egress: egressFilter,
       renewal: provider === "grok_build" ? renewalFilter : undefined,
       risk: provider === "grok_build" ? riskFilter : undefined,
       agreement: provider === "grok_web" ? agreementFilter : undefined,
@@ -571,10 +574,12 @@ export function AccountsPage() {
     setSelection({ provider: value, ids: new Set() });
     setTypeFilter("");
     setStatusFilter("");
+    setStatusDetailFilter("");
     setRenewalFilter("");
     setRiskFilter("");
     setAgreementFilter("");
     setAssociationFilter("");
+    setSort({ field: "lastUsedAt", order: "desc" });
     setQuickImportOpen(false);
     setQuickImportTokens("");
   }
@@ -602,6 +607,7 @@ export function AccountsPage() {
   function openWebConversion(targets: string[] | "all"): void {
     setWebConversionTarget("build");
     setWebConversionStrategy("missing");
+    setWebConversionForce(false);
     setWebConversionTargets(targets);
   }
 
@@ -609,14 +615,15 @@ export function AccountsPage() {
     conversionAbortRef.current?.abort();
     webConsoleSyncAbortRef.current?.abort();
     setWebConversionTargets(null);
+    setWebConversionForce(false);
   }
 
   function runWebConversion(): void {
     if (webConversionTargets === null) return;
     if (webConversionTarget === "build") {
       const input: BuildConversionInput = webConversionTargets === "all"
-        ? { all: true, strategy: webConversionStrategy }
-        : { ids: webConversionTargets, strategy: webConversionStrategy };
+        ? { all: true, strategy: webConversionStrategy, force: webConversionForce }
+        : { ids: webConversionTargets, strategy: webConversionStrategy, force: webConversionForce };
       conversionMutation.mutate(input);
       return;
     }
@@ -828,15 +835,23 @@ export function AccountsPage() {
                   { value: "paid", label: t("accountType.paid") },
                   { value: "unknown", label: t("accountType.pending") },
                 ] }]),
-                { id: "status", label: t("accounts.status"), value: statusFilter, onChange: (value) => { setStatusFilter(value); setPage(1); }, options: [
+                { id: "status", label: t("accounts.status"), value: statusFilter, onChange: (value: string) => { setStatusFilter(value); setStatusDetailFilter(""); setPage(1); }, options: [
                   { value: "active", label: t("accounts.statusActive") },
+                  { value: "abnormal", label: t("accounts.statusAbnormal") },
                   { value: "disabled", label: t("accounts.statusDisabled") },
                   { value: "reauthRequired", label: t("accounts.statusReauthRequired") },
                   { value: "cooldown", label: t("accounts.statusCooldown") },
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
                 ] },
-                { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, onChange: (value) => { setEgressFilter(value); setPage(1); }, options: [
+                ...(statusFilter === "abnormal" ? [{ id: "statusDetail", label: t("accounts.statusAbnormalDetail"), value: statusDetailFilter, onChange: (value: string) => { setStatusDetailFilter(value); setPage(1); }, options: [
+                  { value: "disabled", label: t("accounts.statusDisabled") },
+                  { value: "reauthRequired", label: t("accounts.statusReauthRequired") },
+                  { value: "cooldown", label: t("accounts.statusCooldown") },
+                  { value: "waitingReset", label: t("accounts.waitingReset") },
+                  { value: "probing", label: t("accounts.probing") },
+                ] }] : []),
+                { id: "egress", label: t("accounts.egressFilter"), value: egressFilter, onChange: (value: string) => { setEgressFilter(value); setPage(1); }, options: [
                   { value: "bound", label: t("accounts.egressBound") },
                   { value: "unbound", label: t("accounts.egressUnbound") },
                 ] },
@@ -859,6 +874,8 @@ export function AccountsPage() {
                 ...(provider === "grok_web" ? [{ id: "association", label: t("accounts.associationFilter"), value: associationFilter, onChange: (value: string) => { setAssociationFilter(value); setPage(1); }, options: [
                   { value: "buildLinked", label: t("accounts.associationBuildLinked") },
                   { value: "buildUnlinked", label: t("accounts.associationBuildUnlinked") },
+                  { value: "buildConvertBlocked", label: t("accounts.associationBuildConvertBlocked") },
+                  { value: "buildConvertAllowed", label: t("accounts.associationBuildConvertAllowed") },
                   { value: "consoleLinked", label: t("accounts.associationConsoleLinked") },
                   { value: "consoleUnlinked", label: t("accounts.associationConsoleUnlinked") },
                   { value: "allLinked", label: t("accounts.associationAllLinked") },
@@ -895,15 +912,17 @@ export function AccountsPage() {
         {accountsQuery.isError ? <ErrorState message={accountsQuery.error.message} onRetry={() => void accountsQuery.refetch()} /> : null}
         {result && result.items.length === 0 ? <EmptyState /> : null}
         {accountsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table viewportRows={20} rowHeight={56} className="table-fixed border-collapse min-w-[780px] xl:min-w-[960px] 2xl:min-w-[1080px]">
+          <Table viewportRows={20} rowHeight={56} className="table-fixed border-collapse min-w-[900px] xl:min-w-[1100px] 2xl:min-w-[1240px]">
             <colgroup>
               <col style={{ width: "3%" }} />
-              <col style={{ width: "18%" }} />
+              <col style={{ width: "16%" }} />
+              <col style={{ width: "6%" }} />
               <col style={{ width: "7%" }} />
-              <col style={{ width: "7%" }} />
-              <col style={{ width: provider === "grok_build" ? "27%" : "43%" }} />
-              {provider === "grok_build" ? <col style={{ width: "16%" }} /> : null}
-              <col style={{ width: "18%" }} />
+              <col style={{ width: provider === "grok_build" ? "18%" : "24%" }} />
+              {provider === "grok_build" ? <col style={{ width: "10%" }} /> : null}
+              <col style={{ width: "12%" }} />
+              <col style={{ width: "12%" }} />
+              <col style={{ width: "12%" }} />
               <col style={{ width: "4%" }} />
             </colgroup>
             <TableHeader>
@@ -912,18 +931,20 @@ export function AccountsPage() {
                 <SortableTableHead field="name" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("accounts.account")}</SortableTableHead>
                 <SortableTableHead field="type" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accountType.label")}</SortableTableHead>
                 <SortableTableHead field="status" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accounts.status")}</SortableTableHead>
-                <TableHead className={cn("whitespace-nowrap", provider !== "grok_build" && "px-6")}>{t("accounts.quota")}</TableHead>
+                <SortableTableHead field="quota" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort} className={cn("whitespace-nowrap", provider !== "grok_build" && "px-6")}>{t("accounts.quota")}</SortableTableHead>
                 {provider === "grok_build" ? <TableHead className="whitespace-nowrap pl-4">{t("accountCredential.label")}</TableHead> : null}
+                <TableHead className="whitespace-nowrap">{t("accounts.requestStats")}</TableHead>
+                <SortableTableHead field="lastUsedAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort} className="whitespace-nowrap">{t("accounts.lastUsed")}</SortableTableHead>
                 <SortableTableHead field="createdAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort} className="whitespace-nowrap">{t("accounts.createdAt")}</SortableTableHead>
                 <TableActionHead />
               </TableRow>
             </TableHeader>
             {accountsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={provider === "grok_build" ? 8 : 7} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={provider === "grok_build" ? 10 : 9} /></TableBody>
             ) : (
               <VirtualTableBody
                 items={result?.items ?? []}
-                colSpan={provider === "grok_build" ? 8 : 7}
+                colSpan={provider === "grok_build" ? 10 : 9}
                 rowHeight={56}
                 renderRow={(account) => (
 	                  <TableRow className="group h-14 [&>td]:py-1.5" key={account.id} data-state={selected.has(account.id) ? "selected" : undefined}>
@@ -940,6 +961,10 @@ export function AccountsPage() {
                         </Tooltip>
                       ) : <span className="font-medium text-amber-700 dark:text-amber-300">{t("accountCredential.noAutoRefresh")}</span>}
 	                    </TableCell> : null}
+                    <TableCell className="whitespace-nowrap text-xs">
+                      <AccountRequestStatsCell stats={account.requestStats} locale={i18n.language} />
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{account.lastUsedAt ? formatDateTime(account.lastUsedAt, i18n.language) : "—"}</TableCell>
                     <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(account.createdAt, i18n.language)}</TableCell>
                     <TableActionCell>
                       <DropdownMenu>
@@ -1024,6 +1049,15 @@ export function AccountsPage() {
               ? webConversionStrategy === "missing" ? "accountBulk.missingStrategyDescription" : "accountBulk.allStrategyDescription"
               : webConversionStrategy === "missing" ? "webConsoleSync.missingStrategyDescription" : "webConsoleSync.allStrategyDescription")}</p>
           </div>
+          {webConversionTarget === "build" ? (
+            <label className="flex items-start gap-2 rounded-md border border-border/60 px-3 py-2 text-xs">
+              <Checkbox checked={webConversionForce} disabled={webConversionPending} onCheckedChange={(checked) => setWebConversionForce(checked === true)} className="mt-0.5" />
+              <span className="space-y-0.5">
+                <span className="block font-medium">{t("accountConversion.forceLabel")}</span>
+                <span className="block text-muted-foreground">{t("accountConversion.forceDescription")}</span>
+              </span>
+            </label>
+          ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={webConversionPending || webConversionTargets === null || (Array.isArray(webConversionTargets) && webConversionTargets.length === 0)} onClick={(event) => { event.preventDefault(); runWebConversion(); }}>
@@ -1331,6 +1365,41 @@ function AccountTypeText({ label, title, variant }: { label: string; title?: str
   return <span title={title ?? label} className={cn("max-w-32 truncate text-xs font-medium", variant === "free" ? "text-emerald-700 dark:text-emerald-300" : "text-primary")}>{label}</span>;
 }
 
+function AccountRequestStatsCell({ stats, locale }: { stats?: AccountDTO["requestStats"]; locale: string }) {
+  const { t } = useTranslation();
+  if (!stats) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  const totalOk = formatNumber(stats.successTotal, locale, 0);
+  const totalFail = formatNumber(stats.failTotal, locale, 0);
+  const todayOk = formatNumber(stats.successToday, locale, 0);
+  const todayFail = formatNumber(stats.failToday, locale, 0);
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div tabIndex={0} className="cursor-help space-y-0.5 leading-tight">
+          <div className="tabular-nums">
+            <span className="text-emerald-700 dark:text-emerald-300">{totalOk}</span>
+            <span className="text-muted-foreground">/</span>
+            <span className="text-rose-700 dark:text-rose-300">{totalFail}</span>
+          </div>
+          <div className="text-[11px] text-muted-foreground tabular-nums">
+            {t("accounts.requestStatsTodayShort", { ok: todayOk, fail: todayFail })}
+          </div>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent>
+        {t("accounts.requestStatsTooltip", {
+          totalOk,
+          totalFail,
+          todayOk,
+          todayFail,
+        })}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 function AccountStatus({ account }: { account: AccountDTO }) {
   const { t, i18n } = useTranslation();
   if (!account.enabled) {
@@ -1338,6 +1407,16 @@ function AccountStatus({ account }: { account: AccountDTO }) {
   }
   if (account.authStatus === "reauthRequired") {
     return <Badge variant="destructive">{t("accounts.statusReauthRequired")}</Badge>;
+  }
+  if (account.provider === "grok_web" && account.buildConvertBlockedAt) {
+    return (
+      <div className="flex flex-col items-center gap-0.5">
+        <Badge variant="outline" className="text-emerald-700 dark:text-emerald-300">{t("accounts.statusActive")}</Badge>
+        <StatusTooltip content={t("accounts.buildConvertBlockedTooltip", { reason: account.buildConvertBlockedReason || "invalid_grant", time: formatDateTime(account.buildConvertBlockedAt, i18n.language) })}>
+          <Badge variant="secondary" className="bg-orange-500/10 text-[10px] text-orange-700 dark:text-orange-300">{t("accounts.buildConvertBlocked")}</Badge>
+        </StatusTooltip>
+      </div>
+    );
   }
   const consoleWindow = account.provider === "grok_console"
     ? account.quotaWindows?.find((window) => window.mode === "console" && window.remaining <= 0)

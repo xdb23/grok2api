@@ -394,11 +394,55 @@ func (s *Service) Close(ctx context.Context) error {
 
 func (s *Service) List(ctx context.Context, page, pageSize int) ([]auditdomain.Record, int64, error) {
 	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
-	return s.audits.List(ctx, (page-1)*pageSize, pageSize)
+	items, total, err := s.audits.List(ctx, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.attachAccountRequestStats(ctx, items)
+	return items, total, nil
 }
 
 func (s *Service) Get(ctx context.Context, id uint64) (auditdomain.Record, error) {
-	return s.audits.Get(ctx, id)
+	value, err := s.audits.Get(ctx, id)
+	if err != nil {
+		return auditdomain.Record{}, err
+	}
+	items := []auditdomain.Record{value}
+	s.attachAccountRequestStats(ctx, items)
+	return items[0], nil
+}
+
+// attachAccountRequestStats fills per-row cumulative account success/failure counts
+// (up to and including that audit). Same account on different rows therefore shows
+// different running totals instead of identical lifetime totals.
+func (s *Service) attachAccountRequestStats(ctx context.Context, items []auditdomain.Record) {
+	if len(items) == 0 {
+		return
+	}
+	auditIDs := make([]uint64, 0, len(items))
+	for _, item := range items {
+		if item.ID == 0 || item.AccountID == nil || *item.AccountID == 0 {
+			continue
+		}
+		auditIDs = append(auditIDs, item.ID)
+	}
+	if len(auditIDs) == 0 {
+		return
+	}
+	stats, err := s.audits.AccountRequestStatsAsOf(ctx, auditIDs)
+	if err != nil {
+		s.logger.Warn("audit_account_stats_failed", "error", err, "audits", len(auditIDs))
+		return
+	}
+	for i := range items {
+		stat, ok := stats[items[i].ID]
+		if !ok {
+			continue
+		}
+		items[i].AccountRequestCount = stat.Requests
+		items[i].AccountSuccessCount = stat.Successes
+		items[i].AccountFailureCount = stat.Failures
+	}
 }
 
 // CursorResult 表示按递减 ID 游标读取的一页审计记录。
@@ -431,7 +475,7 @@ func (s *Service) ListCursor(ctx context.Context, rawCursor string, pageSize int
 	if filter.Sort.Field == "" && filter.Sort.Direction == "" {
 		filter.Sort = repository.SortQuery{Field: "createdAt", Direction: repository.SortDescending}
 	}
-	if !validAuditFilter(filter.Status, "", "success", "clientError", "serverError", "error", "failed", "issues", "2xx", "4xx", "5xx") || !validAuditFilter(filter.Mode, "", "stream", "nonStream") || !repository.IsValidSort(filter.Sort, "request", "model", "billing", "tokens", "status", "mode", "duration", "createdAt") {
+	if !validAuditFilter(filter.Status, "", "success", "clientError", "serverError", "error", "failed", "issues", "2xx", "4xx", "5xx") || !validAuditFilter(filter.Mode, "", "stream", "nonStream") || !repository.IsValidSort(filter.Sort, "request", "model", "billing", "tokens", "status", "mode", "duration", "ttft", "tps", "createdAt") {
 		return CursorResult{}, ErrInvalidFilter
 	}
 	cursor, err := decodeAuditCursor(rawCursor, filter.Sort)
@@ -448,6 +492,7 @@ func (s *Service) ListCursor(ctx context.Context, rawCursor string, pageSize int
 	if err != nil {
 		return CursorResult{}, err
 	}
+	s.attachAccountRequestStats(ctx, items)
 	result := CursorResult{Items: items, HasMore: hasMore}
 	if hasMore && len(items) > 0 {
 		result.NextCursor, err = encodeAuditCursor(items[len(items)-1], filter.Sort)
@@ -490,8 +535,10 @@ func parseAuditCursorValue(field, value string) (any, error) {
 	switch field {
 	case "request", "model":
 		return value, nil
-	case "billing", "tokens", "status", "mode", "duration":
+	case "billing", "tokens", "status", "mode", "duration", "ttft":
 		return strconv.ParseInt(value, 10, 64)
+	case "tps":
+		return strconv.ParseFloat(value, 64)
 	case "createdAt":
 		return time.Parse(time.RFC3339Nano, value)
 	default:
@@ -522,6 +569,10 @@ func formatAuditCursorValue(value auditdomain.Record, field string) string {
 		return "0"
 	case "duration":
 		return strconv.FormatInt(value.DurationMS, 10)
+	case "ttft":
+		return strconv.FormatInt(value.TTFTMS, 10)
+	case "tps":
+		return strconv.FormatFloat(value.TokensPerSecond, 'f', 6, 64)
 	default:
 		return value.CreatedAt.UTC().Format(time.RFC3339Nano)
 	}

@@ -22,6 +22,7 @@ func TestStripReasoningEncryptedContentPreservesOnlyPortableHistory(t *testing.T
 			{"type":"reasoning","id":"rs_empty","status":"completed","summary":[],"encrypted_content":"opaque-empty"},
 			{"type":"reasoning","summary":[{"type":"summary_text","text":""}],"encrypted_content":"opaque-blank"},
 			{"type":"reasoning","id":"rs_summary","status":"completed","summary":[{"type":"summary_text","text":"readable"}],"encrypted_content":"opaque-summary"},
+			{"type":"compaction","encrypted_content":"stale-compaction-blob"},
 			{"type":"message","role":"assistant","content":"answer","encrypted_content":"message-value"},
 			{"type":"message","role":"user","content":"continue"}
 		]
@@ -42,6 +43,11 @@ func TestStripReasoningEncryptedContentPreservesOnlyPortableHistory(t *testing.T
 	}
 	if payload.Input[1]["encrypted_content"] != "message-value" {
 		t.Fatalf("non-reasoning encrypted content changed: %#v", payload.Input[1])
+	}
+	for _, item := range payload.Input {
+		if item["type"] == "compaction" {
+			t.Fatalf("compaction encrypted blob was not dropped: %#v", item)
+		}
 	}
 }
 
@@ -176,7 +182,7 @@ func TestRecoverReasoningDecodeFailureResetsSessionWithoutOpaqueInput(t *testing
 		data, _ := io.ReadAll(request.Body)
 		switch call {
 		case 1:
-			if request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key":"session-1"`) {
+			if request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key"`) {
 				t.Fatalf("initial session request headers=%#v body=%s", request.Header, data)
 			}
 			return jsonHTTPResponse(request, http.StatusBadRequest, `{"error":"Could not decode the compaction blob. Ensure it is unmodified from the compact response."}`), nil
@@ -217,7 +223,7 @@ func TestRecoverReasoningDecodeFailureEscalatesFromOpaqueStripToSessionReset(t *
 				t.Fatalf("initial body=%s headers=%#v", data, request.Header)
 			}
 		case 2:
-			if strings.Contains(string(data), `"encrypted_content"`) || request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key":"session-1"`) {
+			if strings.Contains(string(data), `"encrypted_content"`) || request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key"`) {
 				t.Fatalf("opaque downgrade body=%s headers=%#v", data, request.Header)
 			}
 		case 3:
@@ -292,7 +298,7 @@ func TestRecoverReasoningDecodeFailurePreservesRateLimitAfterSessionReset(t *tes
 				t.Fatalf("initial body=%s headers=%#v", data, request.Header)
 			}
 		case 2:
-			if strings.Contains(string(data), `"encrypted_content"`) || request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key":"session-1"`) {
+			if strings.Contains(string(data), `"encrypted_content"`) || request.Header.Get("x-grok-session-id") == "" || !strings.Contains(string(data), `"prompt_cache_key"`) {
 				t.Fatalf("opaque downgrade body=%s headers=%#v", data, request.Header)
 			}
 		case 3:
@@ -409,6 +415,53 @@ func TestRecoverReasoningDecodeFailureDoesNotResetStoredResponseChain(t *testing
 	defer response.Body.Close()
 	if calls.Load() != 1 || response.StatusCode != http.StatusBadRequest || !strings.Contains(response.Header.Get("X-Grok2API-Compatibility-Warnings"), "reasoning_recovery_failed") {
 		t.Fatalf("calls=%d status=%d warnings=%q", calls.Load(), response.StatusCode, response.Header.Get("X-Grok2API-Compatibility-Warnings"))
+	}
+}
+
+func TestRecoverReasoningDecodeFailureEscalatesRetryRejectedToSessionReset(t *testing.T) {
+	adapter, encrypted := newReasoningRecoveryTestAdapter(t)
+	var calls atomic.Int32
+	adapter.http.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		call := calls.Add(1)
+		data, _ := io.ReadAll(request.Body)
+		switch call {
+		case 1:
+			if !strings.Contains(string(data), `"encrypted_content":"opaque"`) {
+				t.Fatalf("initial body=%s", data)
+			}
+			return jsonHTTPResponse(request, http.StatusBadRequest, `{"error":"Could not decrypt the provided encrypted_content. Ensure the value is unmodified."}`), nil
+		case 2:
+			// Strip succeeded, but upstream still rejects for a different reason
+			// (e.g. residual session identity). Must not stop recovery here.
+			if strings.Contains(string(data), `"encrypted_content"`) {
+				t.Fatalf("strip retry still has encrypted content: %s", data)
+			}
+			if request.Header.Get("x-grok-session-id") == "" {
+				t.Fatalf("strip retry dropped session early: %#v", request.Header)
+			}
+			return jsonHTTPResponse(request, http.StatusBadRequest, `{"error":{"message":"session state is invalid"}}`), nil
+		case 3:
+			if strings.Contains(string(data), `"encrypted_content"`) || strings.Contains(string(data), `"prompt_cache_key"`) || request.Header.Get("x-grok-session-id") != "" {
+				t.Fatalf("session reset body=%s headers=%#v", data, request.Header)
+			}
+			return jsonHTTPResponse(request, http.StatusOK, `{"id":"resp_ok","status":"completed","output":[]}`), nil
+		default:
+			t.Fatalf("unexpected call %d", call)
+			return nil, nil
+		}
+	})
+	response, err := adapter.ForwardResponse(t.Context(), provider.ResponseResourceRequest{
+		Credential: account.Credential{ID: 1, Provider: account.ProviderBuild, EncryptedAccessToken: encrypted},
+		Method:     http.MethodPost, Path: "/responses", Model: "grok-4.5", PromptCacheKey: "session-1",
+		Body: []byte(`{"model":"grok-4.5","input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"},{"role":"user","content":"continue"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	warnings := response.Header.Get("X-Grok2API-Compatibility-Warnings")
+	if calls.Load() != 3 || response.StatusCode != http.StatusOK || !strings.Contains(warnings, "reasoning_encrypted_content_downgraded") || !strings.Contains(warnings, "reasoning_session_reset") {
+		t.Fatalf("calls=%d status=%d warnings=%q", calls.Load(), response.StatusCode, warnings)
 	}
 }
 

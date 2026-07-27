@@ -68,6 +68,8 @@ export function AppShell() {
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [documentationOpen, setDocumentationOpen] = useState<Record<string, boolean>>({});
   const isMediaWorkspace = ["/creative-console", "/gallery", "/video-gallery"].includes(location.pathname);
+  // Data-heavy pages use nearly full viewport width (request logs / account pools).
+  const isWideDataWorkspace = ["/request-audits", "/accounts", "/client-keys"].includes(location.pathname);
 
   const passwordSchema = z.object({
     currentPassword: z.string().min(1, t("errors.required")),
@@ -253,7 +255,11 @@ export function AppShell() {
             </Button>
           </header>
 
-          <main className={cn("mx-auto w-full max-w-[1280px] flex-1 px-5 sm:px-8", isMediaWorkspace ? "pt-8 pb-0 lg:pt-20" : "py-8 lg:py-20")}>
+          <main className={cn(
+            "mx-auto w-full flex-1",
+            isWideDataWorkspace ? "max-w-[1920px] px-4 sm:px-6" : "max-w-[1280px] px-5 sm:px-8",
+            isMediaWorkspace ? "pt-8 pb-0 lg:pt-20" : isWideDataWorkspace ? "py-5 lg:py-6" : "py-8 lg:py-20",
+          )}>
             <Outlet />
           </main>
           {!isMediaWorkspace ? <SiteFooter /> : null}
