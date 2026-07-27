@@ -18,6 +18,7 @@ import (
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	dashboardapp "github.com/chenyme/grok2api/backend/internal/application/dashboard"
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
+	resinadmin "github.com/chenyme/grok2api/backend/internal/infra/egress/resin"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	invalidationapp "github.com/chenyme/grok2api/backend/internal/application/invalidation"
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
@@ -311,6 +312,19 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
 	gatewayService.ConfigureMediaAssets(mediaService)
+	if resinClient := resinadmin.NewAdmin(resinadmin.Config{
+		Enabled:      cfg.Egress.Resin.Enabled,
+		AdminBaseURL: cfg.Egress.Resin.AdminBaseURL,
+		AdminToken:   cfg.Egress.Resin.AdminToken,
+		PlatformID:   cfg.Egress.Resin.PlatformID,
+	}); resinClient != nil {
+		gatewayService.ConfigureResinEgress(resinClient, egressManager)
+		platformID := cfg.Egress.Resin.PlatformID
+		if platformID == "" {
+			platformID = resinadmin.DefaultPlatformID
+		}
+		logger.Info("resin_admin_enabled", "base_url", cfg.Egress.Resin.AdminBaseURL, "platform_id", platformID)
+	}
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)

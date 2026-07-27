@@ -1525,6 +1525,54 @@ func (m *Manager) InvalidateClearance(nodeID uint64) {
 	closeRequestClients(stale)
 }
 
+// DropProxyClients closes cached HTTP clients for one egress node so the next
+// request opens a fresh CONNECT. Used after Resin sticky lease release so the
+// new tunnel picks up a new exit IP instead of reusing a pooled tunnel.
+func (m *Manager) DropProxyClients(nodeID uint64) {
+	if m == nil || nodeID == 0 {
+		return
+	}
+	m.clientMu.Lock()
+	stale := m.invalidateClientLocked(nodeID)
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+}
+
+// DropBuildProxyClients closes every cached Build-scope proxy client. After a
+// Resin sticky lease release the next Build request must open a new CONNECT;
+// account-specific client fingerprints make per-identity invalidation awkward.
+func (m *Manager) DropBuildProxyClients() {
+	if m == nil {
+		return
+	}
+	m.clientMu.Lock()
+	var stale []requestClient
+	for key, cached := range m.clients {
+		if key.scope != domain.ScopeBuild {
+			continue
+		}
+		m.invalidateClientVersionLocked(key.nodeID)
+		delete(m.clients, key)
+		stale = append(stale, cached.client)
+	}
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+}
+
+// StickyAccountIdentity returns the Resin sticky account label used in
+// Default.{account} proxy URLs for a provider credential.
+func StickyAccountIdentity(credential accountdomain.Credential) string {
+	identity := strings.TrimSpace(credential.EgressIdentity)
+	if identity == "" {
+		provider := credential.Provider
+		if provider == "" {
+			provider = accountdomain.ProviderBuild
+		}
+		identity = string(provider) + "_" + strconv.FormatUint(credential.ID, 10)
+	}
+	return normalizeProxyAccount(identity)
+}
+
 // ForgetClearance evicts runtime state after an administrator changes or
 // removes a node. Unlike a 403 rejection, it does not mark the persisted
 // last-known-good cookie as invalid; ensureClearance will still verify its

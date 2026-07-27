@@ -35,6 +35,9 @@ type UpstreamFailure struct {
 	// RequestScoped failures are about this prompt/content (e.g. safety policy).
 	// Do not cool the account, refresh OAuth, or rotate accounts.
 	RequestScoped bool
+	// EgressSuspect marks spending-limit style 402s that may be exit-IP hot rather
+	// than true account quota. Gateway may release Resin sticky and retry once.
+	EgressSuspect bool
 	Fingerprint   string
 	RetryAfter    time.Duration
 	Cause         error
@@ -118,6 +121,10 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 		// spending-limit is account-scoped, but its paid/free recovery kind depends on
 		// the selected account's billing snapshot and must be decided by the selector.
 		failure.FreeQuotaExhausted = isFreeQuotaExhaustion(metadataText)
+		// Empirically, personal-team-blocked:spending-limit often tracks a hot Resin
+		// exit IP rather than a true zero-credit account (same token succeeds on a
+		// fresh sticky lease). Flag so the gateway can rotate egress before cooling.
+		failure.EgressSuspect = isSpendingLimitSignal(metadataText, upstreamCode)
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
@@ -227,6 +234,14 @@ func isDefinitiveAccountBlock(text string) bool {
 
 func isPaidQuotaExhaustion(text string) bool {
 	return strings.Contains(text, "personal-team-blocked:spending-limit")
+}
+
+func isSpendingLimitSignal(metadataText, upstreamCode string) bool {
+	code := strings.ToLower(strings.TrimSpace(upstreamCode))
+	if isPaidQuotaExhaustion(code) || strings.Contains(code, "spending-limit") {
+		return true
+	}
+	return isPaidQuotaExhaustion(metadataText) || strings.Contains(metadataText, "spending-limit") || strings.Contains(metadataText, "run out of credits")
 }
 
 func isFreeQuotaExhaustion(text string) bool {

@@ -59,9 +59,25 @@ type Config struct {
 	Batch             BatchConfig             `yaml:"-"`
 	Media             MediaConfig             `yaml:"media"`
 	Routing           RoutingConfig           `yaml:"routing"`
+	// Egress holds optional integrations with sticky proxy pools (e.g. Resin admin).
+	Egress            EgressConfig            `yaml:"egress"`
 	Audit             AuditConfig             `yaml:"audit"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
+}
+
+// EgressConfig configures optional outbound proxy-pool control planes.
+type EgressConfig struct {
+	Resin ResinEgressConfig `yaml:"resin"`
+}
+
+// ResinEgressConfig talks to Resin's admin API to release sticky leases on
+// upstream spending-limit 402 so the same account can retry on a fresh exit IP.
+type ResinEgressConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	AdminBaseURL string `yaml:"adminBaseURL"`
+	AdminToken   string `yaml:"adminToken"`
+	PlatformID   string `yaml:"platformID"`
 }
 
 type ServerConfig struct {
