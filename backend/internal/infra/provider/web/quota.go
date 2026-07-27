@@ -161,6 +161,10 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 			return account.QuotaWindow{}, err
 		}
 		if response.StatusCode == http.StatusForbidden {
+			// blocked-user must not be masked by Statsig invalidation retry.
+			if provider.IsDefinitiveAccountBlockBody(body) {
+				break
+			}
 			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
 				continue
 			}
@@ -171,6 +175,11 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
 		if response.StatusCode == http.StatusUnauthorized {
 			return account.QuotaWindow{}, provider.ErrUnauthorized
+		}
+		// 403 + blocked-user is the same dead-account signal as chat; map to ErrUnauthorized
+		// so quota sync marks reauthRequired. Other 403s stay generic (anti-bot, etc.).
+		if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
+			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
 		}
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 额度接口返回 %d", response.StatusCode)
 	}

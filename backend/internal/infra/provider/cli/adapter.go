@@ -71,7 +71,7 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
 	agentID := uuid.NewString()
 	return &Adapter{
-		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport,
+		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient, func() string { return strings.TrimSpace(cfg.ClientVersion) }), cipher: cipher, base: transport,
 		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
 	}
 }

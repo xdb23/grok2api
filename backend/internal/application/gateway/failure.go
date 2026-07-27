@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
@@ -120,16 +121,20 @@ func newHTTPUpstreamFailure(status int, body []byte, accountID uint64, accountNa
 	case http.StatusForbidden:
 		failure.Code = "upstream_forbidden"
 		failure.PublicMessage = "上游拒绝了该请求"
-		if isContentSafetyRejection(metadataText, upstreamCode) {
-			// Request-level safety / policy: fail this prompt only (aligns with upstream #781 intent).
+		// Safety denials are request-scoped: inspect structured metadata and raw body so
+		// SAFETY_CHECK_TYPE_* markers still match when nested only in free text.
+		if isContentSafetyRejection(metadataText, upstreamCode) || isContentSafetyRejection(strings.ToLower(string(body)), upstreamCode) {
+			// Request-level safety / policy: fail this prompt only (upstream #781 + XDB PlatformBusy split).
 			failure.RequestScoped = true
 			failure.AccountScoped = false
 			failure.Code = "upstream_content_policy"
 			failure.PublicMessage = "上游认为内容不符合使用规范"
 			break
 		}
-		failure.AccountBlocked = isDefinitiveAccountBlock(metadataText)
-		failure.PermanentAccountDenial = isPermanentAccountDenial(metadataText)
+		failure.AccountBlocked = isDefinitiveAccountBlock(metadataText) || provider.IsDefinitiveAccountBlockBody(body)
+		// Permanent denial uses the human message, not bare machine codes like permission-denied
+		// that are shared by request-level policy denials (upstream classification fix).
+		failure.PermanentAccountDenial = isPermanentAccountDenial(upstreamMessage)
 		failure.ModelQuotaExhausted = isModelQuotaExhaustion(metadataText)
 		failure.FreeQuotaExhausted = failure.ModelQuotaExhausted || isFreeQuotaExhaustion(metadataText)
 		failure.QuotaExhausted = failure.FreeQuotaExhausted || isPaidQuotaExhaustion(metadataText)
@@ -206,18 +211,18 @@ func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 }
 
 func isAccountScopedForbidden(text string) bool {
-	return containsAny(text, "quota", "billing", "subscription", "entitlement", "permission", "unauthorized", "authentication", "token", "usage-exhausted", "insufficient", "spending-limit")
+	// Do not match bare "permission" / permission-denied alone: those codes are shared by
+	// request-level policy denials. Account scope requires quota/billing/auth wording.
+	return containsAny(text, "quota", "billing", "subscription", "entitlement", "unauthorized", "authentication", "invalid token", "token expired", "usage-exhausted", "insufficient", "spending-limit")
 }
 
 func isPermanentAccountDenial(text string) bool {
-	if containsAny(text, "permission-denied", "permission_denied", "access to the chat endpoint is denied") {
-		return true
-	}
-	return strings.Trim(strings.TrimSpace(text), " .!\t\r\n") == "access denied"
+	text = strings.ToLower(strings.Trim(strings.TrimSpace(text), " .!\t\r\n"))
+	return strings.Contains(text, "access to the chat endpoint is denied") || text == "access denied"
 }
 
 func isDefinitiveAccountBlock(text string) bool {
-	return containsAny(text, "blocked-user", "user is blocked")
+	return provider.IsDefinitiveAccountBlockText(text)
 }
 
 func isPaidQuotaExhaustion(text string) bool {

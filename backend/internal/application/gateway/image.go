@@ -165,9 +165,10 @@ func (s *Service) executeImage(
 		}
 	}()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
+	// maxAttempts <= 0 means unlimited (same policy as text routing).
 	attempts := int(s.maxAttempts.Load())
 	if attempts <= 0 {
-		attempts = 3
+		attempts = 1_000_000
 	}
 	excluded := make(map[uint64]bool)
 	var lease *accountLease

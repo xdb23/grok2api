@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -164,9 +165,9 @@ type buildForbiddenReauthPolicy struct {
 
 // retryPolicySnapshot is an immutable retry policy published atomically.
 type retryPolicySnapshot struct {
-	statusCodes          map[int]struct{} // empty => legacy defaults (402/403/429/5xx)
-	maxSameFingerprint   int
-	retry5xxWildcard     bool
+	statusCodes        map[int]struct{} // empty => legacy defaults (402/403/429/5xx)
+	maxSameFingerprint int
+	retry5xxWildcard   bool
 }
 
 func defaultRetryPolicySnapshot() *retryPolicySnapshot {
@@ -270,6 +271,10 @@ func (s *Service) UpdateBuildForbiddenReauthPolicy(enabled bool, codes []string)
 
 func (s *Service) shouldInvalidateBuildForbidden(failure *UpstreamFailure) bool {
 	if failure == nil || failure.HTTPStatus != http.StatusForbidden {
+		return false
+	}
+	// Request-level safety / content policy must never trigger account invalidation.
+	if failure.RequestScoped {
 		return false
 	}
 	policy := s.buildForbiddenReauth.Load()
@@ -683,9 +688,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
+	// maxAttempts <= 0 means unlimited account rotation (upstream v3.0.10 routing policy).
+	// Cap at a large finite bound so a runaway loop cannot hang forever.
 	attempts := int(s.maxAttempts.Load())
 	if attempts <= 0 {
-		attempts = 3
+		attempts = 1_000_000
 	}
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	if ownership != nil {
@@ -886,17 +893,42 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
+		// 403 must be classified by body first (upstream ba81e8d): blocked-user → reauth + rotate;
+		// only non-block 403 may be treated as egress anti-bot without account penalty.
+		if response.StatusCode == http.StatusForbidden {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if lastFailure.RequestScoped {
+				lease.Release()
+				lastErr = lastFailure
+				s.logger.Warn("upstream_request_scoped_failure", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode)
+				break attemptLoop
+			}
+			if lastFailure.AccountBlocked {
+				failureHandled := s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+				if lastFailure.AccountScoped && !failureHandled {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+				permanentStickyBreak = true
+				lease.Release()
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "account_blocked", true)
+				continue
+			}
+			if egressForbidden && !finalEgressForbidden {
+				// Non-block 403: egress/session challenge — do not penalize the account.
+				delete(excluded, credential.ID)
+				lease.Release()
+				lastErr = fmt.Errorf("上游出口会话被拒绝")
+				continue
+			}
+			// Final non-block 403 (or non-egress provider): reattach body for shared retry path.
+			response.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		if s.isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
-			if egressForbidden {
-				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
-				delete(excluded, credential.ID)
-				lease.Release()
-				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
-				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-				continue
-			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			// Content/safety policy: fail this request only — no OAuth refresh, no cool-down, no rotate.
 			if lastFailure.RequestScoped {
@@ -1537,7 +1569,7 @@ func (s *Service) isRetryableResponse(response *provider.Response, upstreamProvi
 	if response == nil || !s.statusAllowsRetry(response.StatusCode) {
 		return false
 	}
-	// Build 402/403 account billing/permission still force rotation even if 403 removed from list? 
+	// Build 402/403 account billing/permission still force rotation even if 403 removed from list?
 	// Keep forcesAccountFailover only when status is still allowed OR is 402/403 for Build.
 	if forcesAccountFailover(response.StatusCode, upstreamProvider) {
 		return true

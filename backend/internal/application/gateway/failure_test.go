@@ -119,6 +119,15 @@ func TestHTTPUpstreamFailureClassifiesContentSafetyAsRequestScoped(t *testing.T)
 	}
 }
 
+func TestHTTPUpstreamFailureBarePermissionDeniedIsNotAccountScoped(t *testing.T) {
+	// Bare permission-denied without chat-endpoint wording is request/policy level;
+	// must not cool or invalidate accounts (upstream classification fix).
+	failure := newHTTPUpstreamFailure(http.StatusForbidden, []byte(`{"code":"permission-denied","error":"permission denied"}`), 9, "build")
+	if failure.AccountScoped || failure.PermanentAccountDenial || failure.AccountBlocked || failure.RequestScoped {
+		t.Fatalf("failure = %#v", failure)
+	}
+}
+
 func TestHTTPUpstreamFailureLeavesPaymentRecoveryKindToBilling(t *testing.T) {
 	failure := newHTTPUpstreamFailure(http.StatusPaymentRequired, []byte(`{
 		"code":"personal-team-blocked:spending-limit",

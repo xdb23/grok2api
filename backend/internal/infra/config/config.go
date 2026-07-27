@@ -201,9 +201,9 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL                 Duration `yaml:"stickyTTL"`
-	CooldownBase              Duration `yaml:"cooldownBase"`
-	CooldownMax               Duration `yaml:"cooldownMax"`
+	StickyTTL    Duration `yaml:"stickyTTL"`
+	CooldownBase Duration `yaml:"cooldownBase"`
+	CooldownMax  Duration `yaml:"cooldownMax"`
 	CapacityWait Duration `yaml:"capacityWait"`
 	// StickyCapacityWait is how long a sticky session waits on its bound account
 	// before temporary borrow. Zero means use capacityWait. Under high gate load
@@ -214,21 +214,22 @@ type RoutingConfig struct {
 	// forces sticky borrow and cold prompt cache. 0 disables the floor (use account value).
 	MinAccountConcurrent int `yaml:"minAccountConcurrent"`
 	// MaxAttempts is how many different accounts a single request may try.
+	// 0 means unlimited rotation (still bounded by a large safety cap at runtime).
 	MaxAttempts int `yaml:"maxAttempts"`
 	// RetryStatusCodes lists upstream HTTP statuses that trigger account rotation.
 	// Empty keeps legacy defaults: 402, 403, 429, and all 5xx.
 	RetryStatusCodes []int `yaml:"retryStatusCodes"`
 	// MaxSameFingerprint stops retrying after N identical non-account failures (default 2).
-	MaxSameFingerprint int  `yaml:"maxSameFingerprint"`
-	PreferFreeBuild    bool `yaml:"preferFreeBuild"`
-	SegmentedSelectorEnabled  bool     `yaml:"segmentedSelectorEnabled"`
-	SegmentedMinCandidates    int      `yaml:"segmentedSelectorMinCandidates"`
-	SegmentedWindowSize       int      `yaml:"segmentedSelectorWindowSize"`
+	MaxSameFingerprint       int  `yaml:"maxSameFingerprint"`
+	PreferFreeBuild          bool `yaml:"preferFreeBuild"`
+	SegmentedSelectorEnabled bool `yaml:"segmentedSelectorEnabled"`
+	SegmentedMinCandidates   int  `yaml:"segmentedSelectorMinCandidates"`
+	SegmentedWindowSize      int  `yaml:"segmentedSelectorWindowSize"`
 	// ReadyRingEnabled enables O(window) round-robin claim without full-pool scoring.
 	// Intended for large build pools (tens of thousands) under high concurrent load.
-	ReadyRingEnabled       bool `yaml:"readyRingEnabled"`
-	ReadyRingMinCandidates int  `yaml:"readyRingMinCandidates"`
-	ReadyRingWindowSize    int  `yaml:"readyRingWindowSize"`
+	ReadyRingEnabled          bool     `yaml:"readyRingEnabled"`
+	ReadyRingMinCandidates    int      `yaml:"readyRingMinCandidates"`
+	ReadyRingWindowSize       int      `yaml:"readyRingWindowSize"`
 	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
@@ -560,7 +561,7 @@ func (c Config) Validate() error {
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
-	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
+	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 0 || c.Routing.MaxAttempts > 1_000_000 {
 		return errors.New("routing 配置无效")
 	}
 	if stickyWait := c.Routing.StickyCapacityWait.Value(); stickyWait < 0 || stickyWait > 5*time.Second {
@@ -719,7 +720,7 @@ func defaultConfig() Config {
 			CooldownMax:               Duration(30 * time.Minute),
 			CapacityWait:              Duration(500 * time.Millisecond),
 			StickyCapacityWait:        Duration(time.Second), // CPA-like: brief wait then borrow without rebind
-			MinAccountConcurrent:      4,                    // floor free accounts imported as max_concurrent=1
+			MinAccountConcurrent:      4,                     // floor free accounts imported as max_concurrent=1
 			MaxAttempts:               3,
 			RetryStatusCodes:          nil, // legacy: 402/403/429/5xx
 			MaxSameFingerprint:        2,
