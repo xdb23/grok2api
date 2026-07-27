@@ -69,13 +69,16 @@ routing:
   segmentedSelectorMinCandidates: 3000
   segmentedSelectorWindowSize: 64
 
-# Optional: Resin sticky-proxy admin (release lease on spending-limit 402).
+# Optional: Resin sticky-proxy admin + spending-limit 402 policy.
 egress:
   resin:
     enabled: false
     adminBaseURL: "http://127.0.0.1:3030"
     adminToken: ""
     platformID: "00000000-0000-0000-0000-000000000000"
+  spendingLimit:
+    maxEgressRotations: 3
+    softCooldown: 1h
 
 audit:
   bufferSize: 16384

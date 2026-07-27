@@ -317,12 +317,15 @@ func parseBillingTime(raw string) (time.Time, bool) {
 	return value.UTC(), true
 }
 
-// QuotaRecoveryKind 区分需要真实流量探测的 Free 额度和需要 Billing 探测的付费账期。
+// QuotaRecoveryKind 区分 Free 额度、付费账期，以及 402 spending-limit 出口类软冷却。
 type QuotaRecoveryKind string
 
 const (
-	QuotaRecoveryKindFree QuotaRecoveryKind = "free"
-	QuotaRecoveryKindPaid QuotaRecoveryKind = "paid"
+	QuotaRecoveryKindFree          QuotaRecoveryKind = "free"
+	QuotaRecoveryKindPaid          QuotaRecoveryKind = "paid"
+	// QuotaRecoveryKindSpendingLimit is Build 402 personal-team-blocked:spending-limit
+	// after egress retries fail. Kept separate from free/paid so ops can filter it.
+	QuotaRecoveryKindSpendingLimit QuotaRecoveryKind = "spending_limit"
 )
 
 // QuotaRecoveryStatus 表示 Free 额度耗尽后的持久化恢复状态。

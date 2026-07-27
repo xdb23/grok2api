@@ -68,7 +68,8 @@ type Config struct {
 
 // EgressConfig configures optional outbound proxy-pool control planes.
 type EgressConfig struct {
-	Resin ResinEgressConfig `yaml:"resin"`
+	Resin         ResinEgressConfig         `yaml:"resin"`
+	SpendingLimit SpendingLimitEgressConfig `yaml:"spendingLimit"`
 }
 
 // ResinEgressConfig talks to Resin's admin API to release sticky leases on
@@ -78,6 +79,18 @@ type ResinEgressConfig struct {
 	AdminBaseURL string `yaml:"adminBaseURL"`
 	AdminToken   string `yaml:"adminToken"`
 	PlatformID   string `yaml:"platformID"`
+}
+
+// SpendingLimitEgressConfig controls Build 402 personal-team-blocked:spending-limit
+// handling: rotate Resin exit N times, then soft-cool the account separately from
+// free/paid quota recovery.
+type SpendingLimitEgressConfig struct {
+	// MaxEgressRotations is how many extra same-account Resin sticky releases
+	// are allowed per request after the first spending-limit 402 (default 3).
+	MaxEgressRotations int `yaml:"maxEgressRotations"`
+	// SoftCooldown is how long a spending_limit recovery keeps the account out of
+	// the normal pool after egress retries are exhausted (default 1h).
+	SoftCooldown Duration `yaml:"softCooldown"`
 }
 
 type ServerConfig struct {
@@ -345,6 +358,7 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.applyReadyRingDefaults()
+	cfg.applySpendingLimitDefaults()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -362,6 +376,22 @@ func (c *Config) applyReadyRingDefaults() {
 	}
 	if c.Routing.ReadyRingWindowSize == 0 {
 		c.Routing.ReadyRingWindowSize = 64
+	}
+}
+
+// applySpendingLimitDefaults fills zero egress spending-limit policy fields.
+func (c *Config) applySpendingLimitDefaults() {
+	if c.Egress.SpendingLimit.MaxEgressRotations <= 0 {
+		c.Egress.SpendingLimit.MaxEgressRotations = 3
+	}
+	if c.Egress.SpendingLimit.MaxEgressRotations > 10 {
+		c.Egress.SpendingLimit.MaxEgressRotations = 10
+	}
+	if c.Egress.SpendingLimit.SoftCooldown.Value() <= 0 {
+		c.Egress.SpendingLimit.SoftCooldown = Duration(time.Hour)
+	}
+	if c.Egress.SpendingLimit.SoftCooldown.Value() > 72*time.Hour {
+		c.Egress.SpendingLimit.SoftCooldown = Duration(72 * time.Hour)
 	}
 }
 

@@ -166,7 +166,7 @@ func (billingModel) TableName() string { return "account_billing_snapshots" }
 
 type quotaRecoveryModel struct {
 	AccountID       uint64 `gorm:"primaryKey"`
-	Kind            string `gorm:"size:16;not null;check:chk_quota_recovery_kind,kind IN ('free','paid')"`
+	Kind            string `gorm:"size:16;not null;check:chk_quota_recovery_kind,kind IN ('free','paid','spending_limit')"`
 	Status          string `gorm:"size:32;not null;check:chk_quota_recovery_status,status IN ('exhausted','probing')"`
 	ConfirmedUsed   int64  `gorm:"not null;default:0;check:chk_quota_recovery_used,confirmed_used >= 0"`
 	ConfirmedLimit  int64  `gorm:"not null;default:0;check:chk_quota_recovery_limit,confirmed_limit >= 0"`

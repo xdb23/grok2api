@@ -147,6 +147,10 @@ type Service struct {
 	responses            repository.ResponseRepository
 	resinAdmin           resinLeaseRotator
 	proxyClients         proxyClientDropper
+	// spendingLimitMaxEgressRotations: extra same-account Resin releases per request (default 3).
+	spendingLimitMaxEgressRotations atomic.Int64
+	// spendingLimitSoftCooldown: soft park duration after egress retries exhausted (default 1h).
+	spendingLimitSoftCooldown       atomic.Int64
 	maxAttempts          atomic.Int64
 	retryPolicy          atomic.Pointer[retryPolicySnapshot]
 	buildForbiddenReauth atomic.Pointer[buildForbiddenReauthPolicy]
@@ -225,6 +229,41 @@ func (s *Service) ConfigureResinEgress(admin resinLeaseRotator, proxyClients pro
 	}
 	s.resinAdmin = admin
 	s.proxyClients = proxyClients
+}
+
+// ConfigureSpendingLimitPolicy sets same-account egress rotate count and soft cooldown.
+// maxEgressRotations is extra Resin releases after the first 402 (0→default 3, cap 10).
+// softCooldown zero → 1h.
+func (s *Service) ConfigureSpendingLimitPolicy(maxEgressRotations int, softCooldown time.Duration) {
+	if s == nil {
+		return
+	}
+	if maxEgressRotations <= 0 {
+		maxEgressRotations = 3
+	}
+	if maxEgressRotations > 10 {
+		maxEgressRotations = 10
+	}
+	if softCooldown <= 0 {
+		softCooldown = time.Hour
+	}
+	if softCooldown > 72*time.Hour {
+		softCooldown = 72 * time.Hour
+	}
+	s.spendingLimitMaxEgressRotations.Store(int64(maxEgressRotations))
+	s.spendingLimitSoftCooldown.Store(int64(softCooldown))
+}
+
+func (s *Service) spendingLimitPolicy() (maxRotations int, softCooldown time.Duration) {
+	maxRotations = int(s.spendingLimitMaxEgressRotations.Load())
+	if maxRotations <= 0 {
+		maxRotations = 3
+	}
+	softCooldown = time.Duration(s.spendingLimitSoftCooldown.Load())
+	if softCooldown <= 0 {
+		softCooldown = time.Hour
+	}
+	return maxRotations, softCooldown
 }
 
 // UpdateRetryPolicy replaces which upstream HTTP statuses trigger account rotation
@@ -716,6 +755,18 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if attempts <= 0 {
 		attempts = 1_000_000
 	}
+	// Same-account Resin egress rotations need extra loop slots beyond account switches.
+	maxEgressRotationsBudget, _ := s.spendingLimitPolicy()
+	if maxEgressRotationsBudget > 0 && attempts < 1_000_000 {
+		// Worst case: every account burns 1 initial + N egress retries.
+		expanded := attempts * (1 + maxEgressRotationsBudget)
+		if expanded > 64 {
+			expanded = 64
+		}
+		if expanded > attempts {
+			attempts = expanded
+		}
+	}
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	if ownership != nil {
 		attempts = 1
@@ -732,10 +783,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
-	// egressRotated tracks Build accounts that already got one Resin sticky release
-	// for spending-limit 402 in this request (at most one egress retry per account).
-	egressRotated := make(map[uint64]bool)
+	// egressRotateCount tracks same-account Resin sticky releases for spending-limit 402.
+	egressRotateCount := make(map[uint64]int)
 	var pinRetryAccountID uint64
+	pinRetryEgressForce := false
+	maxEgressRotations, spendingSoftCooldown := s.spendingLimitPolicy()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	quotaProbeAttempted := false
 	// permanentStickyBreak is set when we leave an account for quota/auth reasons so the
@@ -770,8 +822,25 @@ attemptLoop:
 		if pinRetryAccountID != 0 {
 			// Same-account egress retry after Resin sticky release.
 			pinnedID := pinRetryAccountID
+			forceEgress := pinRetryEgressForce
 			pinRetryAccountID = 0
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, pinnedID, route.UpstreamModel, quotaMode, true)
+			pinRetryEgressForce = false
+			if forceEgress {
+				lease, err = s.selector.AcquirePinnedEgressRetry(ctx, route.Provider, pinnedID, route.UpstreamModel, quotaMode)
+				if err != nil {
+					// Do not end the whole request: fall back to another account.
+					s.logger.Warn("egress_pin_retry_failed",
+						"request_id", input.RequestID,
+						"account_id", pinnedID,
+						"rotation", egressRotateCount[pinnedID],
+						"error", err,
+					)
+					excluded[pinnedID] = true
+					lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+				}
+			} else {
+				lease, err = s.selector.AcquirePinned(ctx, route.Provider, pinnedID, route.UpstreamModel, quotaMode, true)
+			}
 		} else if ownership != nil {
 			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
 		} else {
@@ -1057,21 +1126,36 @@ attemptLoop:
 				failureHandled = true
 				permanentStickyBreak = true
 			} else if lastFailure.QuotaExhausted {
-				// spending-limit 402: try one Resin sticky release + same-account retry before
-				// treating the account as truly out of credits (exit-IP heat is common).
-				if lastFailure.EgressSuspect && credential.Provider == accountdomain.ProviderBuild &&
-					s.tryRotateResinEgress(ctx, input.RequestID, credential, lease, egressRotated) {
-					lease.Release()
-					lastErr = fmt.Errorf("上游返回 %d（已释放出口粘性，同号重试）", response.StatusCode)
-					pinRetryAccountID = credential.ID
-					delete(excluded, credential.ID)
-					continue
+				// spending-limit 402: rotate Resin exit up to N times on the same account,
+				// then soft-cool with kind=spending_limit (not free/paid quota recovery).
+				if lastFailure.EgressSuspect && credential.Provider == accountdomain.ProviderBuild {
+					rotated := egressRotateCount[credential.ID]
+					if rotated < maxEgressRotations &&
+						s.tryRotateResinEgress(ctx, input.RequestID, credential, lease, egressRotateCount, maxEgressRotations) {
+						lease.Release()
+						lastErr = fmt.Errorf("上游返回 %d（出口粘性已释放 %d/%d，同号重试）", response.StatusCode, egressRotateCount[credential.ID], maxEgressRotations)
+						pinRetryAccountID = credential.ID
+						pinRetryEgressForce = true
+						delete(excluded, credential.ID)
+						continue
+					}
+					s.selector.MarkSpendingLimitSoftCooldown(ctx, credential, spendingSoftCooldown)
+					failureHandled = true
+					permanentStickyBreak = true
+					s.logger.Warn("spending_limit_soft_cooldown",
+						"request_id", input.RequestID,
+						"account_id", credential.ID,
+						"account_name", credential.Name,
+						"egress_rotations", egressRotateCount[credential.ID],
+						"soft_cooldown", spendingSoftCooldown.String(),
+					)
+				} else {
+					s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+					permanentStickyBreak = true
 				}
-				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
-				failureHandled = true
-				permanentStickyBreak = true
 			}
 			if lastFailure.AccountBlocked {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
@@ -1553,15 +1637,16 @@ func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Contex
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
-// tryRotateResinEgress releases the Resin sticky lease for this account once per
-// request so the next attempt opens a fresh CONNECT on a different exit IP.
-// Returns true when the gateway should pin-retry the same account without
-// marking payment-quota exhaustion.
-func (s *Service) tryRotateResinEgress(ctx context.Context, requestID string, credential accountdomain.Credential, lease *accountLease, egressRotated map[uint64]bool) bool {
+// tryRotateResinEgress releases the Resin sticky lease so the next CONNECT can
+// land on a different exit IP. Caller tracks per-account rotation count against maxRotations.
+func (s *Service) tryRotateResinEgress(ctx context.Context, requestID string, credential accountdomain.Credential, lease *accountLease, egressRotateCount map[uint64]int, maxRotations int) bool {
 	if s == nil || s.resinAdmin == nil || !s.resinAdmin.Enabled() {
 		return false
 	}
-	if credential.ID == 0 || egressRotated[credential.ID] {
+	if credential.ID == 0 || maxRotations <= 0 {
+		return false
+	}
+	if egressRotateCount[credential.ID] >= maxRotations {
 		return false
 	}
 	identity := infraegress.StickyAccountIdentity(credential)
@@ -1569,7 +1654,6 @@ func (s *Service) tryRotateResinEgress(ctx context.Context, requestID string, cr
 		return false
 	}
 	oldIP, oldNode, err := s.resinAdmin.RotateAccountLease(ctx, identity)
-	egressRotated[credential.ID] = true
 	if err != nil {
 		s.logger.Warn("resin_lease_release_failed",
 			"request_id", requestID,
@@ -1577,14 +1661,13 @@ func (s *Service) tryRotateResinEgress(ctx context.Context, requestID string, cr
 			"sticky_account", identity,
 			"error", err,
 		)
-		// Still treat as rotated so we do not loop release attempts; fall through
-		// to normal quota handling on the next failure path only if we return false.
 		return false
 	}
+	egressRotateCount[credential.ID]++
 	if s.proxyClients != nil {
 		s.proxyClients.DropBuildProxyClients()
 	}
-	_ = lease // concurrency lease released by caller
+	_ = lease
 	s.logger.Warn("resin_egress_rotated",
 		"request_id", requestID,
 		"account_id", credential.ID,
@@ -1592,6 +1675,8 @@ func (s *Service) tryRotateResinEgress(ctx context.Context, requestID string, cr
 		"sticky_account", identity,
 		"old_egress_ip", oldIP,
 		"old_node_hash", oldNode,
+		"rotation", egressRotateCount[credential.ID],
+		"max_rotations", maxRotations,
 		"reason", "spending_limit_402",
 	)
 	return true

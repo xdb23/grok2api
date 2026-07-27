@@ -961,6 +961,7 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 
 // MarkPaymentQuotaExhausted 将 402/spending-limit 账号移出号池。付费账号按真实账期
 // 进行 Billing 探测；Free/Unknown 依次采用上游 ResetAt、Retry-After、账期时间和 20h fallback。
+// Prefer MarkSpendingLimitSoftCooldown for Build spending-limit after egress retries.
 func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential account.Credential, hints quotaRecoveryHints) {
 	now := time.Now().UTC()
 	if hints.Billing != nil && hints.Billing.IsPaid() {
@@ -976,6 +977,72 @@ func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential acc
 	}
 	hints.Fallback = paymentRequiredRecoveryPause
 	s.MarkFreeQuotaExhausted(ctx, credential, 0, 0, hints)
+}
+
+// MarkSpendingLimitSoftCooldown parks an account after spending-limit 402 survived
+// configurable Resin egress rotations. Uses kind=spending_limit so ops can filter
+// separately from free/paid quota exhaustion.
+func (s *Selector) MarkSpendingLimitSoftCooldown(ctx context.Context, credential account.Credential, pause time.Duration) {
+	if pause <= 0 {
+		pause = time.Hour
+	}
+	if pause > 72*time.Hour {
+		pause = 72 * time.Hour
+	}
+	now := time.Now().UTC()
+	nextProbeAt := now.Add(pause)
+	// Soft: do not extend past first-exhaust + pause when re-hit during cooldown.
+	if existing, err := s.accounts.GetQuotaRecovery(ctx, credential.ID); err == nil &&
+		existing.Kind == account.QuotaRecoveryKindSpendingLimit && existing.ExhaustedAt != nil && !existing.ExhaustedAt.IsZero() {
+		exhaustedAt := existing.ExhaustedAt.UTC()
+		capAt := exhaustedAt.Add(pause)
+		if existing.NextProbeAt != nil && !existing.NextProbeAt.Before(now) && existing.NextProbeAt.Before(nextProbeAt) {
+			nextProbeAt = existing.NextProbeAt.UTC()
+		}
+		if nextProbeAt.After(capAt) {
+			nextProbeAt = capAt
+		}
+		_ = s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+			AccountID: credential.ID, Kind: account.QuotaRecoveryKindSpendingLimit, Status: account.QuotaRecoveryStatusExhausted,
+			ExhaustedAt: &exhaustedAt, NextProbeAt: &nextProbeAt, LastConfirmedAt: &now, UpdatedAt: now,
+		})
+	} else {
+		_ = s.accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+			AccountID: credential.ID, Kind: account.QuotaRecoveryKindSpendingLimit, Status: account.QuotaRecoveryStatusExhausted,
+			ExhaustedAt: &now, NextProbeAt: &nextProbeAt, LastConfirmedAt: &now, UpdatedAt: now,
+		})
+	}
+	s.forgetProvenAccount(credential.ID)
+	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	s.invalidateCandidates(credential.Provider)
+}
+
+// AcquirePinnedEgressRetry re-leases one account for same-request Resin exit rotation.
+// It skips quota-recovery gates so a prior free/spending_limit soft-cool cannot block
+// the egress retry that is supposed to clear a hot IP.
+func (s *Selector) AcquirePinnedEgressRetry(ctx context.Context, provider account.Provider, accountID uint64, upstreamModel, quotaMode string) (*accountLease, error) {
+	now := time.Now().UTC()
+	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range values {
+		value := candidate.Credential
+		if value.ID != accountID {
+			continue
+		}
+		if !value.Enabled || value.AuthStatus != account.AuthStatusActive {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+		}
+		lease, err := s.acquirePinnedCapacity(ctx, value)
+		if err != nil {
+			return nil, err
+		}
+		lease.Billing = candidate.Billing
+		lease.QuotaMode = quotaMode
+		return lease, nil
+	}
+	return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 }
 
 func (s *Selector) resolveQuotaRecoveryAt(ctx context.Context, accountID uint64, now time.Time, hints quotaRecoveryHints) time.Time {

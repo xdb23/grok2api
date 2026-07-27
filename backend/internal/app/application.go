@@ -312,6 +312,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
 	gatewayService.ConfigureMediaAssets(mediaService)
+	gatewayService.ConfigureSpendingLimitPolicy(cfg.Egress.SpendingLimit.MaxEgressRotations, cfg.Egress.SpendingLimit.SoftCooldown.Value())
 	if resinClient := resinadmin.NewAdmin(resinadmin.Config{
 		Enabled:      cfg.Egress.Resin.Enabled,
 		AdminBaseURL: cfg.Egress.Resin.AdminBaseURL,
@@ -323,7 +324,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		if platformID == "" {
 			platformID = resinadmin.DefaultPlatformID
 		}
-		logger.Info("resin_admin_enabled", "base_url", cfg.Egress.Resin.AdminBaseURL, "platform_id", platformID)
+		logger.Info("resin_admin_enabled",
+			"base_url", cfg.Egress.Resin.AdminBaseURL,
+			"platform_id", platformID,
+			"max_egress_rotations", cfg.Egress.SpendingLimit.MaxEgressRotations,
+			"soft_cooldown", cfg.Egress.SpendingLimit.SoftCooldown.Value().String(),
+		)
 	}
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)

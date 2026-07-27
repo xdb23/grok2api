@@ -166,6 +166,9 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if err := d.ensureClientKeyLimitConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移客户端 Key 限额约束: %w", err)
 	}
+	if err := d.ensureQuotaRecoveryKindConstraints(ctx); err != nil {
+		return fmt.Errorf("迁移额度恢复 kind 约束: %w", err)
+	}
 	if err := d.backfillWebEgressIdentities(ctx); err != nil {
 		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
@@ -399,6 +402,13 @@ func (d *Database) ensureMediaAssetConstraints(ctx context.Context) error {
 	return d.ensureNamedConstraints(ctx, []consoleConstraint{
 		{model: &mediaAssetModel{}, table: "media_assets", name: "chk_media_assets_size"},
 	}, "268435456")
+}
+
+// ensureQuotaRecoveryKindConstraints adds spending_limit as a distinct recovery kind.
+func (d *Database) ensureQuotaRecoveryKindConstraints(ctx context.Context) error {
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &quotaRecoveryModel{}, table: "account_quota_recovery", name: "chk_quota_recovery_kind"},
+	}, "spending_limit")
 }
 
 // ensureClientKeyLimitConstraints 将历史正数限制升级为允许 0 表示无限制。
