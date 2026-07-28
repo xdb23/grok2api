@@ -684,3 +684,78 @@ func TestAdditionalToolsAndRemoteCompactionTrigger(t *testing.T) {
 		t.Fatalf("additional tools = %q, compaction = %t", first, compatibility.compactionRequested)
 	}
 }
+
+// CPA-style: empty name/call_id on tool call history must not 400 the whole request.
+func TestEmptyToolCallNameHistoryIsOmittedLikeCPA(t *testing.T) {
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"orphan"},
+			{"type":"function_call","call_id":"call_ok","name":"lookup","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_ok","output":"ok"},
+			{"type":"custom_tool_call","call_id":"ctc_bad","name":"","input":"x"},
+			{"type":"custom_tool_call_output","call_id":"ctc_bad","output":"y"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatalf("expected CPA-style omit, got error: %v", err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := request["input"].([]any)
+	// user, call_ok, output_ok, user continue — bad call/output pairs dropped
+	if len(items) != 4 {
+		t.Fatalf("input len=%d want 4: %#v", len(items), items)
+	}
+	if items[1].(map[string]any)["type"] != "function_call" || items[1].(map[string]any)["name"] != "lookup" {
+		t.Fatalf("kept call = %#v", items[1])
+	}
+	if items[2].(map[string]any)["type"] != "function_call_output" || items[2].(map[string]any)["call_id"] != "call_ok" {
+		t.Fatalf("kept output = %#v", items[2])
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "empty_tool_call_history_omitted") {
+		t.Fatalf("expected empty_tool_call_history_omitted warning, got %#v", compatibility)
+	}
+}
+
+func TestEmptyToolCallNameOnlyWithoutCallIDIsOmitted(t *testing.T) {
+	// Matches the production failure shape: function_call at input[N] with blank name.
+	normalized, compatibility, err := normalizeResponsesRequest([]byte(`{
+		"model":"public",
+		"input":[
+			{"type":"message","role":"user","content":"a"},
+			{"type":"message","role":"assistant","content":"b"},
+			{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":"data"},
+			{"type":"message","role":"user","content":"c"},
+			{"type":"message","role":"assistant","content":"d"},
+			{"type":"message","role":"user","content":"e"},
+			{"type":"function_call","name":"","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`), "grok-4.5")
+	if err != nil {
+		t.Fatalf("input[7] empty name must be omitted not rejected: %v", err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(normalized, &request); err != nil {
+		t.Fatal(err)
+	}
+	items := request["input"].([]any)
+	// 9 items minus 1 omitted empty-name call = 8
+	if len(items) != 8 {
+		t.Fatalf("input len=%d want 8: %#v", len(items), items)
+	}
+	last := items[len(items)-1].(map[string]any)
+	if last["role"] != "user" {
+		t.Fatalf("last item = %#v", last)
+	}
+	if compatibility == nil || !strings.Contains(compatibility.warningHeader(), "empty_tool_call_history_omitted") {
+		t.Fatalf("warnings = %#v", compatibility)
+	}
+}

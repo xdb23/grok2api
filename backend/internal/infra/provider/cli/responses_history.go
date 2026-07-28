@@ -34,6 +34,10 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "function_call":
+			// CPA-style: empty name/call_id → drop item (do not 400 the whole request).
+			if c.omitMalformedToolCallHistory(item) {
+				continue
+			}
 			converted, err := c.normalizeFunctionCallInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
@@ -41,6 +45,9 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "function_call_output":
+			if c.omitDroppedToolCallOutput(item) {
+				continue
+			}
 			converted, err := c.normalizeFunctionCallOutputInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
@@ -114,6 +121,10 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 				rewritten = append(rewritten, compatibilityBoundaryMessage(message))
 			}
 		case "custom_tool_call":
+			// Match CPA normalizeXAIInputCustomToolCalls: drop when name or call_id empty.
+			if c.omitMalformedToolCallHistory(item) {
+				continue
+			}
 			converted, err := c.normalizeCustomToolCallInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err
@@ -121,6 +132,15 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "custom_tool_call_output":
+			if c.omitDroppedToolCallOutput(item) {
+				continue
+			}
+			// CPA also drops custom_tool_call_output with empty call_id.
+			if strings.TrimSpace(stringField(item, "call_id")) == "" {
+				c.changed = true
+				c.addWarning("empty_tool_call_history_omitted")
+				continue
+			}
 			converted, err := c.normalizeCustomToolCallOutputInput(item, param)
 			if err != nil {
 				return nil, nil, nil, err

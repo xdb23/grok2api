@@ -42,6 +42,9 @@ type responsesToolCompatibility struct {
 	clientSearchParam   string
 	serverSearchEager   bool
 	streamCalls         map[string]*responsesStreamCall
+	// omittedCallIDs tracks function/custom tool calls dropped for empty name/call_id
+	// (CPA-style) so matching *_output history items can be dropped too.
+	omittedCallIDs      map[string]struct{}
 	legacyLocalShell    bool
 	nativeShell         bool
 	webSearchDisabled   bool
@@ -65,8 +68,48 @@ func newResponsesToolCompatibility() *responsesToolCompatibility {
 		aliases:         make(map[string]responsesToolIdentity),
 		identityAliases: make(map[string]string),
 		streamCalls:     make(map[string]*responsesStreamCall),
+		omittedCallIDs:  make(map[string]struct{}),
 		warningSet:      make(map[string]struct{}),
 	}
+}
+
+// omitMalformedToolCallHistory drops function_call / custom_tool_call items that
+// lack name or call_id, matching CLIProxyAPI normalizeXAIInputCustomToolCalls:
+// bad history is skipped instead of failing the whole request with 400.
+func (c *responsesToolCompatibility) omitMalformedToolCallHistory(item map[string]any) bool {
+	if c == nil || item == nil {
+		return false
+	}
+	name := strings.TrimSpace(stringField(item, "name"))
+	callID := strings.TrimSpace(stringField(item, "call_id"))
+	if name != "" && callID != "" {
+		return false
+	}
+	c.changed = true
+	c.addWarning("empty_tool_call_history_omitted")
+	if callID != "" {
+		if c.omittedCallIDs == nil {
+			c.omittedCallIDs = make(map[string]struct{})
+		}
+		c.omittedCallIDs[callID] = struct{}{}
+	}
+	return true
+}
+
+func (c *responsesToolCompatibility) omitDroppedToolCallOutput(item map[string]any) bool {
+	if c == nil || item == nil || len(c.omittedCallIDs) == 0 {
+		return false
+	}
+	callID := strings.TrimSpace(stringField(item, "call_id"))
+	if callID == "" {
+		return false
+	}
+	if _, ok := c.omittedCallIDs[callID]; !ok {
+		return false
+	}
+	c.changed = true
+	c.addWarning("empty_tool_call_history_omitted")
+	return true
 }
 
 func (c *responsesToolCompatibility) alias(identity responsesToolIdentity) string {
