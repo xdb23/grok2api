@@ -394,14 +394,25 @@ function AccountValue({
 
 function AttemptsValue({ audit, attempts }: { audit: AuditDTO; attempts: number }) {
   const { t } = useTranslation();
+  // attemptCount = intermediate failures (e.g. 402 egress rotate) before the final status.
+  // Final row is still the successful (or last) outcome — do not present retries as the request status.
+  const failedBeforeSuccess = (audit.attemptCount ?? 0) > 0 && audit.statusCode >= 200 && audit.statusCode < 300 && !audit.errorCode;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button type="button" className="cursor-help tabular-nums">{attempts}</button>
+        <button type="button" className={cn("cursor-help tabular-nums", failedBeforeSuccess ? "text-amber-700 dark:text-amber-300" : undefined)}>
+          {attempts}
+          {failedBeforeSuccess ? <span className="ml-0.5 text-[10px] text-muted-foreground">↻</span> : null}
+        </button>
       </TooltipTrigger>
       <TooltipContent className="max-w-72 space-y-1 py-2" side="top">
         <div>{t("audits.upstreamAttempts")}: {audit.upstreamAttempts ?? 0}</div>
         <div>{t("audits.failedAttempts")}: {audit.attemptCount ?? 0}</div>
+        {failedBeforeSuccess ? (
+          <div className="text-primary-foreground/80">
+            {t("audits.retryThenSuccessHint", { defaultValue: "中间有失败尝试（如 402 换出口），最终以本行状态/账号/用量为准；点状态列查看每次 attempt。" })}
+          </div>
+        ) : null}
         <div>{t("audits.selection")}: {formatDuration(audit.selectionMs ?? 0)} · {t("audits.credential")}: {formatDuration(audit.credentialMs ?? 0)}</div>
         <div>{t("audits.firstHeaders")}: {formatDuration(audit.firstHeadersMs ?? 0)} · {t("audits.upstreamWait")}: {formatDuration(audit.upstreamWaitMs ?? 0)}</div>
       </TooltipContent>
@@ -453,17 +464,23 @@ function StatusCode({ statusCode, hasError = false }: { statusCode: number; hasE
 function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void }) {
   const { t } = useTranslation();
   const mode = audit.operation === "compaction" ? t("audits.operations.compaction") : audit.streaming ? t("audits.stream") : t("audits.nonStream");
-  // Soft failures (2xx + errorCode) and hard HTTP failures open the diagnostics dialog.
-  const hasIssue = Boolean(audit.errorCode) || audit.attemptCount > 0 || audit.statusCode < 200 || audit.statusCode >= 300;
+  // Final HTTP status is the source of truth. Intermediate 402/429 retries that later
+  // succeeded must still show as 200 success — open diagnostics for attempt detail.
+  const finalFailed = Boolean(audit.errorCode) || audit.statusCode < 200 || audit.statusCode >= 300;
+  const recoveredViaRetry = !finalFailed && (audit.attemptCount ?? 0) > 0;
+  const openDiagnostics = finalFailed || recoveredViaRetry;
   const content = (
     <>
-      <StatusCode statusCode={audit.statusCode} hasError={hasIssue} />
-      <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
+      <StatusCode statusCode={audit.statusCode} hasError={finalFailed} />
+      <span className="block whitespace-nowrap text-[10px] text-muted-foreground">
+        {mode}
+        {recoveredViaRetry ? ` · ${t("audits.retriedOk", { defaultValue: "经重试成功" })}` : ""}
+      </span>
     </>
   );
   // Always clickable when there is anything to diagnose; keep the status column clean
   // and put the real error body / transport detail inside the dialog.
-  if (!hasIssue) return <div className="space-y-0.5 text-center">{content}</div>;
+  if (!openDiagnostics) return <div className="space-y-0.5 text-center">{content}</div>;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -471,6 +488,11 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
       </TooltipTrigger>
       <TooltipContent className="max-w-80 whitespace-normal break-words text-left leading-5" side="top">
         <div>{t("audits.clickForDiagnostics")}</div>
+        {recoveredViaRetry ? (
+          <div className="mt-1 text-primary-foreground/70">
+            {t("audits.retryThenSuccessHint", { defaultValue: "中间有失败尝试（如 402 换出口），最终以本行状态/账号/用量为准；点状态列查看每次 attempt。" })}
+          </div>
+        ) : null}
         {audit.errorCode ? <div className="mt-1 text-primary-foreground/70">{audit.errorCode}</div> : null}
       </TooltipContent>
     </Tooltip>
