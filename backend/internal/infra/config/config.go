@@ -47,18 +47,18 @@ var buildForbiddenCodePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{
 
 // Config 表示后端运行配置。
 type Config struct {
-	Server            ServerConfig            `yaml:"server"`
-	Frontend          FrontendConfig          `yaml:"frontend"`
-	Database          DatabaseConfig          `yaml:"database"`
-	RuntimeStore      RuntimeStoreConfig      `yaml:"runtimeStore"`
-	Deployment        DeploymentConfig        `yaml:"deployment"`
-	Auth              AuthConfig              `yaml:"auth"`
-	Secrets           Secrets                 `yaml:"secrets"`
-	BootstrapAdmin    BootstrapAdminConfig    `yaml:"bootstrapAdmin"`
-	Provider          ProviderConfig          `yaml:"provider"`
-	Batch             BatchConfig             `yaml:"-"`
-	Media             MediaConfig             `yaml:"media"`
-	Routing           RoutingConfig           `yaml:"routing"`
+	Server         ServerConfig         `yaml:"server"`
+	Frontend       FrontendConfig       `yaml:"frontend"`
+	Database       DatabaseConfig       `yaml:"database"`
+	RuntimeStore   RuntimeStoreConfig   `yaml:"runtimeStore"`
+	Deployment     DeploymentConfig     `yaml:"deployment"`
+	Auth           AuthConfig           `yaml:"auth"`
+	Secrets        Secrets              `yaml:"secrets"`
+	BootstrapAdmin BootstrapAdminConfig `yaml:"bootstrapAdmin"`
+	Provider       ProviderConfig       `yaml:"provider"`
+	Batch          BatchConfig          `yaml:"-"`
+	Media          MediaConfig          `yaml:"media"`
+	Routing        RoutingConfig        `yaml:"routing"`
 	// Egress holds optional integrations with sticky proxy pools (e.g. Resin admin).
 	Egress            EgressConfig            `yaml:"egress"`
 	Audit             AuditConfig             `yaml:"audit"`
@@ -358,7 +358,7 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.applyReadyRingDefaults()
-	cfg.applySpendingLimitDefaults()
+	cfg.ApplySpendingLimitDefaults()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -379,8 +379,8 @@ func (c *Config) applyReadyRingDefaults() {
 	}
 }
 
-// applySpendingLimitDefaults fills zero egress spending-limit policy fields.
-func (c *Config) applySpendingLimitDefaults() {
+// ApplySpendingLimitDefaults fills zero egress spending-limit policy fields.
+func (c *Config) ApplySpendingLimitDefaults() {
 	if c.Egress.SpendingLimit.MaxEgressRotations <= 0 {
 		c.Egress.SpendingLimit.MaxEgressRotations = 3
 	}

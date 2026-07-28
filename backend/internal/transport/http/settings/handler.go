@@ -32,6 +32,12 @@ type settingsConfigDTO struct {
 	Audit             auditConfigDTO             `json:"audit"`
 	ClientKeyDefaults clientKeyDefaultsConfigDTO `json:"clientKeyDefaults"`
 	Accounts          *accountsConfigDTO         `json:"accounts,omitempty"`
+	SpendingLimit     *spendingLimitConfigDTO    `json:"spendingLimit,omitempty"`
+}
+
+type spendingLimitConfigDTO struct {
+	MaxEgressRotations int    `json:"maxEgressRotations"`
+	SoftCooldown       string `json:"softCooldown"`
 }
 
 type serverConfigDTO struct {
@@ -244,6 +250,13 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		}
 		result.AccountsProvided = true
 	}
+	if value.SpendingLimit != nil {
+		result.SpendingLimit = settingsapp.SpendingLimitConfig{
+			MaxEgressRotations: value.SpendingLimit.MaxEgressRotations,
+			SoftCooldown:       value.SpendingLimit.SoftCooldown,
+		}
+		result.SpendingLimitProvided = true
+	}
 	return result
 }
 
@@ -307,6 +320,10 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				AutoCleanReauthInterval:   config.Accounts.AutoCleanReauthInterval,
 				AutoCleanReauthMinAge:     config.Accounts.AutoCleanReauthMinAge,
 				AutoCleanIncludeDisabled:  config.Accounts.AutoCleanIncludeDisabled,
+			},
+			SpendingLimit: &spendingLimitConfigDTO{
+				MaxEgressRotations: config.SpendingLimit.MaxEgressRotations,
+				SoftCooldown:       config.SpendingLimit.SoftCooldown,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{

@@ -13,6 +13,10 @@ const byteSizeSchema = z.object({ value: z.number().positive(), unit: z.enum(["M
 const routingTTLDuration = durationSchema.refine((value) => durationSeconds(value) <= 30 * 86_400);
 const routingCooldownDuration = durationSchema.refine((value) => durationSeconds(value) <= 86_400);
 const routingCapacityWaitDuration = durationSchema.refine((value) => durationSeconds(value) <= 5);
+const spendingLimitSoftCooldownDuration = durationSchema.refine((value) => {
+  const seconds = durationSeconds(value);
+  return seconds >= 60 && seconds <= 72 * 3_600;
+});
 const auditFlushDuration = durationSchema.refine((value) => {
   const seconds = durationSeconds(value);
   return seconds >= 0.01 && seconds <= 60;
@@ -153,6 +157,10 @@ export const settingsSchema = z.object({
     }),
     autoCleanIncludeDisabled: z.boolean(),
   }),
+  spendingLimit: z.object({
+    maxEgressRotations: z.number().int().min(1).max(10),
+    softCooldown: spendingLimitSoftCooldownDuration,
+  }),
 });
 
 export type SettingsForm = z.infer<typeof settingsSchema>;
@@ -195,6 +203,10 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       autoCleanReauthMinAge: parseDuration(config.accounts.autoCleanReauthMinAge),
       autoCleanIncludeDisabled: config.accounts.autoCleanIncludeDisabled,
     },
+    spendingLimit: {
+      maxEgressRotations: config.spendingLimit.maxEgressRotations,
+      softCooldown: parseDuration(config.spendingLimit.softCooldown),
+    },
   };
 }
 
@@ -234,6 +246,10 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       autoCleanReauthInterval: formatDuration(config.accounts.autoCleanReauthInterval),
       autoCleanReauthMinAge: formatDuration(config.accounts.autoCleanReauthMinAge),
       autoCleanIncludeDisabled: config.accounts.autoCleanIncludeDisabled,
+    },
+    spendingLimit: {
+      maxEgressRotations: config.spendingLimit.maxEgressRotations,
+      softCooldown: formatDuration(config.spendingLimit.softCooldown),
     },
   };
 }

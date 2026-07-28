@@ -33,6 +33,10 @@ export type SettingsConfigDTO = {
     autoCleanReauthMinAge: string;
     autoCleanIncludeDisabled: boolean;
   };
+  spendingLimit: {
+    maxEgressRotations: number;
+    softCooldown: string;
+  };
 };
 
 export type EgressNodeDTO = {
@@ -107,6 +111,10 @@ const settingsConfigValidator = hasShape({
     autoCleanReauthMinAge: isString,
     autoCleanIncludeDisabled: isBoolean,
   })),
+  spendingLimit: isOptional(hasShape({
+    maxEgressRotations: isNumber,
+    softCooldown: isString,
+  })),
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   markBuildForbiddenReauth: false,
@@ -116,8 +124,13 @@ const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   autoCleanReauthMinAge: "1h",
   autoCleanIncludeDisabled: false,
 });
+const defaultSpendingLimitConfig = (): SettingsConfigDTO["spendingLimit"] => ({
+  maxEgressRotations: 3,
+  softCooldown: "1h",
+});
 function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDTO {
   const accounts = snapshot.config.accounts ?? defaultAccountsConfig();
+  const spendingLimit = snapshot.config.spendingLimit ?? defaultSpendingLimitConfig();
   const segmentedSelector = snapshot.config.routing.segmentedSelector ?? { enabled: false, minCandidates: 3000, windowSize: 64 };
   return {
     ...snapshot,
@@ -142,6 +155,10 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
         autoCleanReauthInterval: accounts.autoCleanReauthInterval || "10m",
         autoCleanReauthMinAge: accounts.autoCleanReauthMinAge || "1h",
         autoCleanIncludeDisabled: accounts.autoCleanIncludeDisabled ?? false,
+      },
+      spendingLimit: {
+        maxEgressRotations: spendingLimit.maxEgressRotations > 0 ? spendingLimit.maxEgressRotations : 3,
+        softCooldown: spendingLimit.softCooldown || "1h",
       },
     },
   };

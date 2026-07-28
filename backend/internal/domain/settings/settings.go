@@ -21,6 +21,17 @@ type Config struct {
 	Audit             AuditConfig
 	ClientKeyDefaults ClientKeyDefaultsConfig
 	Accounts          AccountsConfig
+	// SpendingLimit is Build 402 personal-team-blocked:spending-limit policy.
+	// Nil means older persisted settings; yaml/startup defaults must be preserved.
+	SpendingLimit *SpendingLimitConfig
+}
+
+// SpendingLimitConfig is hot-reloadable same-account egress rotate + soft park policy.
+type SpendingLimitConfig struct {
+	// MaxEgressRotations is extra Resin releases after the first 402 (0–10; 0 means use default 3 when applying).
+	MaxEgressRotations int
+	// SoftCooldown parks the account after egress retries are exhausted.
+	SoftCooldown time.Duration
 }
 
 // ServerConfig 定义可热更新的推理入口容量参数。

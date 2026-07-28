@@ -135,6 +135,12 @@ type AccountsConfig struct {
 	BuildForbiddenReauthCodesProvided bool
 }
 
+// SpendingLimitConfig 是管理接口使用的 Build 402 spending-limit 策略输入。
+type SpendingLimitConfig struct {
+	MaxEgressRotations int
+	SoftCooldown       string
+}
+
 // EditableConfig 聚合管理端允许修改的运行参数。
 type EditableConfig struct {
 	Server            ServerConfig
@@ -150,6 +156,9 @@ type EditableConfig struct {
 	Accounts          AccountsConfig
 	// AccountsProvided 区分旧管理端未发送 accounts 与显式提交默认值。
 	AccountsProvided bool
+	SpendingLimit    SpendingLimitConfig
+	// SpendingLimitProvided 区分旧管理端未发送 spendingLimit 与显式提交。
+	SpendingLimitProvided bool
 }
 
 // Snapshot 表示当前运行设置和需要重启才能生效的字段。
@@ -364,14 +373,17 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		SegmentedSelectorEnabled: segmentedEnabled,
 		SegmentedMinCandidates:   segmentedMinCandidates,
 		SegmentedWindowSize:      segmentedWindowSize,
-		// Ready-ring is startup/yaml policy for now; preserve across runtime settings reloads.
+		// YAML-only routing policy: preserve across runtime settings reloads.
+		StickyCapacityWait:     base.Routing.StickyCapacityWait,
+		MinAccountConcurrent:   base.Routing.MinAccountConcurrent,
 		ReadyRingEnabled:       base.Routing.ReadyRingEnabled,
 		ReadyRingMinCandidates: base.Routing.ReadyRingMinCandidates,
 		ReadyRingWindowSize:    base.Routing.ReadyRingWindowSize,
 		// Retry policy is startup/yaml for now; preserve across runtime settings reloads.
-		RetryStatusCodes:   append([]int(nil), base.Routing.RetryStatusCodes...),
-		MaxSameFingerprint: base.Routing.MaxSameFingerprint,
-		ReasoningReplayEnabled:   base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
+		RetryStatusCodes:          append([]int(nil), base.Routing.RetryStatusCodes...),
+		MaxSameFingerprint:        base.Routing.MaxSameFingerprint,
+		ReasoningReplayEnabled:    base.Routing.ReasoningReplayEnabled,
+		ReasoningReplayTTL:        base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
 	}
 	commitDelay := base.Audit.CommitDelay.Value()
@@ -399,6 +411,14 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Accounts.MarkBuildForbiddenReauth = value.Accounts.MarkBuildForbiddenReauth
 	if value.Accounts.BuildForbiddenReauthCodes != nil {
 		base.Accounts.BuildForbiddenReauthCodes = append([]string(nil), value.Accounts.BuildForbiddenReauthCodes...)
+	}
+	// SpendingLimit 为后续新增段；旧持久化缺字段时沿用 yaml/启动默认。
+	if value.SpendingLimit != nil {
+		base.Egress.SpendingLimit.MaxEgressRotations = value.SpendingLimit.MaxEgressRotations
+		if value.SpendingLimit.SoftCooldown > 0 {
+			base.Egress.SpendingLimit.SoftCooldown = config.Duration(value.SpendingLimit.SoftCooldown)
+		}
+		base.ApplySpendingLimitDefaults()
 	}
 	return base
 }
@@ -461,6 +481,10 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			AutoCleanReauthInterval:   value.Accounts.AutoCleanReauthInterval.Value(),
 			AutoCleanReauthMinAge:     value.Accounts.AutoCleanReauthMinAge.Value(),
 			AutoCleanIncludeDisabled:  value.Accounts.AutoCleanIncludeDisabled,
+		},
+		SpendingLimit: &settingsdomain.SpendingLimitConfig{
+			MaxEgressRotations: value.Egress.SpendingLimit.MaxEgressRotations,
+			SoftCooldown:       value.Egress.SpendingLimit.SoftCooldown.Value(),
 		},
 	}
 }
@@ -546,6 +570,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		next.Accounts.AutoCleanReauthEnabled = input.Accounts.AutoCleanReauthEnabled
 		next.Accounts.AutoCleanIncludeDisabled = input.Accounts.AutoCleanIncludeDisabled
 	}
+	if input.SpendingLimitProvided {
+		next.Egress.SpendingLimit.MaxEgressRotations = input.SpendingLimit.MaxEgressRotations
+	}
 
 	type durationInput struct {
 		path  string
@@ -568,6 +595,11 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		{"media.cleanupInterval", input.Media.CleanupInterval, func(value config.Duration) { next.Media.CleanupInterval = value }},
 		{"batch.randomDelay", input.Batch.RandomDelay, func(value config.Duration) { next.Batch.RandomDelay = value }},
 	}
+	if input.SpendingLimitProvided {
+		durations = append(durations, durationInput{"spendingLimit.softCooldown", input.SpendingLimit.SoftCooldown, func(value config.Duration) {
+			next.Egress.SpendingLimit.SoftCooldown = value
+		}})
+	}
 	if strings.TrimSpace(input.ProviderBuild.ResponseHeaderTimeout) != "" {
 		durations = append(durations, durationInput{"providerBuild.responseHeaderTimeout", input.ProviderBuild.ResponseHeaderTimeout, func(value config.Duration) { next.Provider.Build.ResponseHeaderTimeout = value }})
 	}
@@ -589,6 +621,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 			return config.Config{}, fmt.Errorf("%s 必须是有效时长", item.path)
 		}
 		item.set(config.Duration(value))
+	}
+	if input.SpendingLimitProvided {
+		next.ApplySpendingLimitDefaults()
 	}
 	if err := next.Validate(); err != nil {
 		return config.Config{}, err
@@ -656,6 +691,11 @@ func toEditable(cfg config.Config) EditableConfig {
 			AutoCleanIncludeDisabled:          cfg.Accounts.AutoCleanIncludeDisabled,
 		},
 		AccountsProvided: true,
+		SpendingLimit: SpendingLimitConfig{
+			MaxEgressRotations: cfg.Egress.SpendingLimit.MaxEgressRotations,
+			SoftCooldown:       cfg.Egress.SpendingLimit.SoftCooldown.String(),
+		},
+		SpendingLimitProvided: true,
 	}
 }
 
