@@ -40,10 +40,10 @@ var (
 var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
 
 const (
-	estimatedFreeTokenLimit      int64         = 1_000_000
-	freeUsageWindow              time.Duration = 24 * time.Hour
-	forcedRefreshMinInterval     time.Duration = 30 * time.Second
-	paidProbeRetryInterval       time.Duration = 15 * time.Minute
+	estimatedFreeTokenLimit  int64         = 1_000_000
+	freeUsageWindow          time.Duration = 24 * time.Hour
+	forcedRefreshMinInterval time.Duration = 30 * time.Second
+	paidProbeRetryInterval   time.Duration = 15 * time.Minute
 	// Background / scheduler proactive window: refresh before absolute expiry.
 	credentialRefreshAdvance time.Duration = 3 * time.Minute
 	// Request hot path only blocks when the access token is already expired or
@@ -57,7 +57,7 @@ const (
 	credentialStateWriteTimeout time.Duration = 5 * time.Second
 	// Keep batches modest so background OAuth does not monopolize a core for minutes
 	// when tens of thousands of tokens share similar expiry (import/restart backlog).
-	credentialRefreshBatchSize = 25
+	credentialRefreshBatchSize                 = 25
 	managedTaskWorkerCeiling                   = 50
 	webQuotaRefreshQueueSize                   = 4096
 	webQuotaRefreshTimeout                     = 30 * time.Second
@@ -329,9 +329,14 @@ type Service struct {
 	autoClean             AutoCleanConfig
 	autoCleanRevision     uint64
 	autoCleanWake         chan struct{}
-	buildBotFlagCache     *resultcache.Cache[string, []uint64]
-	logger                *slog.Logger
-	now                   func() time.Time
+	// buildReauthRemint: after Build reauth(invalid_grant), try linked Web→Build remint.
+	remintMu          sync.Mutex
+	remintStates      map[uint64]buildReauthRemintState // key = build account id
+	remintWake        chan struct{}
+	remintRunning     map[uint64]struct{}
+	buildBotFlagCache *resultcache.Cache[string, []uint64]
+	logger            *slog.Logger
+	now               func() time.Time
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -382,6 +387,9 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 			Enabled: false, Interval: 10 * time.Minute, MinAge: time.Hour, IncludeDisabled: false,
 		},
 		autoCleanWake:     make(chan struct{}, 1),
+		remintStates:      make(map[uint64]buildReauthRemintState),
+		remintWake:        make(chan struct{}, 1),
+		remintRunning:     make(map[uint64]struct{}),
 		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
 		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
@@ -1767,6 +1775,10 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 	}
 	if s.sticky != nil {
 		_ = s.sticky.DeleteByAccount(ctx, id)
+	}
+	// Build OAuth permanent failure: try linked Web→Build remint (async).
+	if shouldScheduleBuildReauthRemint(value, reason) {
+		s.scheduleBuildReauthRemint(id)
 	}
 	return nil
 }

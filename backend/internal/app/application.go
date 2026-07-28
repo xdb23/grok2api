@@ -18,7 +18,6 @@ import (
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	dashboardapp "github.com/chenyme/grok2api/backend/internal/application/dashboard"
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
-	resinadmin "github.com/chenyme/grok2api/backend/internal/infra/egress/resin"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	invalidationapp "github.com/chenyme/grok2api/backend/internal/application/invalidation"
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
@@ -30,6 +29,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	resinadmin "github.com/chenyme/grok2api/backend/internal/infra/egress/resin"
 	inframedia "github.com/chenyme/grok2api/backend/internal/infra/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -379,6 +379,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateRetryPolicy(next.Routing.RetryStatusCodes, next.Routing.MaxSameFingerprint)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
+		gatewayService.ConfigureSpendingLimitPolicy(next.Egress.SpendingLimit.MaxEgressRotations, next.Egress.SpendingLimit.SoftCooldown.Value())
 		auditService.UpdateWriterConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value(), next.Audit.CommitDelay.Value())
 		auditService.UpdateLedgerConfig(auditLedgerConfig(next.Audit))
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
@@ -547,6 +548,10 @@ func (a *Application) Run(ctx context.Context) error {
 	})
 	startBackground("credential_refresh", func(taskCtx context.Context) error {
 		a.accounts.RunCredentialRefresh(taskCtx)
+		return nil
+	})
+	startBackground("build_reauth_remint", func(taskCtx context.Context) error {
+		a.accounts.RunBuildReauthRemint(taskCtx)
 		return nil
 	})
 	startBackground("account_auto_clean", func(taskCtx context.Context) error {
