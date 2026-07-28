@@ -2,10 +2,8 @@ package system
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
@@ -42,10 +40,11 @@ func TestHandlerReturnsOnlyPublicFrontendConfig(t *testing.T) {
 func TestHandlerReturnsAndChecksVersion(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"tag_name":"v3.0.1","body":"Notes"}`))}, nil
+		t.Fatal("official release check must not be performed")
+		return nil, nil
 	})}
 	router := gin.New()
-	updates := updatecheckapp.NewService("v3.0.0", client)
+	updates := updatecheckapp.NewService("dev", client)
 	NewHandler(nil, updates).Register(router.Group("/api/admin/v1"))
 
 	for _, test := range []struct {
@@ -53,8 +52,8 @@ func TestHandlerReturnsAndChecksVersion(t *testing.T) {
 		path   string
 		status string
 	}{
-		{method: http.MethodGet, path: "/api/admin/v1/system/version", status: "unchecked"},
-		{method: http.MethodPost, path: "/api/admin/v1/system/update/check", status: "update_available"},
+		{method: http.MethodGet, path: "/api/admin/v1/system/version", status: "up_to_date"},
+		{method: http.MethodPost, path: "/api/admin/v1/system/update/check", status: "up_to_date"},
 	} {
 		request := httptest.NewRequest(test.method, test.path, nil)
 		recorder := httptest.NewRecorder()
@@ -64,14 +63,16 @@ func TestHandlerReturnsAndChecksVersion(t *testing.T) {
 		}
 		var payload struct {
 			Data struct {
-				CurrentVersion string `json:"currentVersion"`
-				Status         string `json:"status"`
+				CurrentVersion  string `json:"currentVersion"`
+				LatestVersion   string `json:"latestVersion"`
+				UpdateAvailable bool   `json:"updateAvailable"`
+				Status          string `json:"status"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 			t.Fatal(err)
 		}
-		if payload.Data.CurrentVersion != "v3.0.0" || payload.Data.Status != test.status {
+		if payload.Data.CurrentVersion != "dev" || payload.Data.LatestVersion != "dev" || payload.Data.UpdateAvailable || payload.Data.Status != test.status {
 			t.Fatalf("%s %s data = %#v", test.method, test.path, payload.Data)
 		}
 	}

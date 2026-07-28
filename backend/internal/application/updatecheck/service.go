@@ -60,13 +60,18 @@ func NewService(currentVersion string, client *http.Client) *Service {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
+	// Fork builds do not poll upstream GitHub releases; treat the running build as current.
+	now := time.Now().UTC()
 	return &Service{
 		current: currentVersion,
 		client:  client,
 		now:     time.Now,
 		snapshot: Snapshot{
-			CurrentVersion: currentVersion,
-			Status:         StatusUnchecked,
+			CurrentVersion:  currentVersion,
+			LatestVersion:   currentVersion,
+			UpdateAvailable: false,
+			Status:          StatusUpToDate,
+			CheckedAt:       &now,
 		},
 	}
 }
@@ -78,37 +83,17 @@ func (s *Service) Snapshot() Snapshot {
 }
 
 func (s *Service) Check(ctx context.Context) Snapshot {
-	result, err, _ := s.checks.Do("latest", func() (any, error) {
-		return s.fetchLatest(ctx)
-	})
+	_ = ctx
+	// Skip official chenyme/grok2api release checks for this fork; always report up to date.
+	checkedAt := s.now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err != nil {
-		s.snapshot.Status = StatusCheckFailed
-		s.snapshot.Error = err.Error()
-		return cloneSnapshot(s.snapshot)
-	}
-	release := result.(latestRelease)
-	checkedAt := s.now().UTC()
-	current, currentOK := parseSemanticVersion(s.current)
-	latest, latestOK := parseSemanticVersion(release.Tag)
-	if !currentOK || !latestOK {
-		s.snapshot.LatestVersion = release.Tag
-		s.snapshot.ReleaseURL = release.URL
-		s.snapshot.ReleaseNotes = release.Notes
-		s.snapshot.Status = StatusCheckFailed
-		s.snapshot.Error = "当前版本或最新版本不是有效的语义化版本，无法比较"
-		return cloneSnapshot(s.snapshot)
-	}
-	available := compareSemanticVersion(latest, current) > 0
 	s.snapshot = Snapshot{
-		CurrentVersion: s.current, LatestVersion: release.Tag,
-		UpdateAvailable: available, CheckedAt: &checkedAt,
-		ReleaseURL: release.URL, ReleaseNotes: release.Notes,
-		Status: StatusUpToDate,
-	}
-	if available {
-		s.snapshot.Status = StatusUpdateAvailable
+		CurrentVersion:  s.current,
+		LatestVersion:   s.current,
+		UpdateAvailable: false,
+		CheckedAt:       &checkedAt,
+		Status:          StatusUpToDate,
 	}
 	return cloneSnapshot(s.snapshot)
 }
