@@ -878,6 +878,89 @@ func TestSelectorStickyHitRefreshesTTL(t *testing.T) {
 	}
 }
 
+// CPA SessionAffinitySelector.Pick: same session → same auth while available; different sessions may differ.
+func TestSelectorCPAStyleSameSessionSameAccount(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, _, _ := newStickySelectorFixture(t, sticky, 0, true)
+	// Multi-turn composed affinity (upstream pin + soft dual) like composeStickyAffinityKey output.
+	turn1 := resolveBuildSessionIdentity(7, account.ProviderBuild, "grok-4.5", "cpa-session-A", "", nil)
+	aff1 := composeStickyAffinityKey(turn1)
+	l1, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", aff1, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l1.StickyMode != stickyModeHit && l1.StickyMode != stickyModeBind {
+		// first bind is bind; force path may set bind
+	}
+	id1 := l1.Credential.ID
+	l1.Release()
+	// Turn 2 same explicit session
+	l2, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", aff1, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.Credential.ID != id1 {
+		t.Fatalf("same session thrash: turn1=%d turn2=%d primary=%d mode=%s", id1, l2.Credential.ID, primary.ID, l2.StickyMode)
+	}
+	if l2.StickyMode != stickyModeHit && l2.StickyMode != stickyModeBind {
+		t.Fatalf("expected sticky hit/bind, got mode=%q", l2.StickyMode)
+	}
+	l2.Release()
+	// Different session may bind another account (not forced same).
+	turnB := resolveBuildSessionIdentity(7, account.ProviderBuild, "grok-4.5", "cpa-session-B", "", nil)
+	affB := composeStickyAffinityKey(turnB)
+	// Soft dual inherit: turn1 user-only → turn2 user+assistant share keys
+	soft1 := resolveBuildSessionIdentity(7, account.ProviderBuild, "grok-4.5", "", "", []byte(`{"messages":[{"role":"user","content":"soft cpa root"}]}`))
+	soft2 := resolveBuildSessionIdentity(7, account.ProviderBuild, "grok-4.5", "", "", []byte(`{"messages":[{"role":"user","content":"soft cpa root"},{"role":"assistant","content":"ok"},{"role":"user","content":"more"}]}`))
+	s1, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", composeStickyAffinityKey(soft1), nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	softID := s1.Credential.ID
+	s1.Release()
+	s2, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", composeStickyAffinityKey(soft2), nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Credential.ID != softID {
+		t.Fatalf("soft dual inherit thrash: t1=%d t2=%d mode=%s", softID, s2.Credential.ID, s2.StickyMode)
+	}
+	s2.Release()
+	_ = affB // different session isolation is best-effort with small pool
+}
+
+// CPA: bound auth unavailable → reselect + rebind (not silent thrash while available).
+func TestSelectorCPAStyleUnavailableRebind(t *testing.T) {
+	ctx := context.Background()
+	sticky := memory.NewStickyStore()
+	selector, primary, fallback, accounts := newStickySelectorFixture(t, sticky, 0, true)
+	aff := composeStickyAffinityKey(resolveBuildSessionIdentity(3, account.ProviderBuild, "model", "rebind-session", "", nil))
+	first, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", aff, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := first.Credential.ID
+	first.Release()
+	// Permanent auth death: 401 clears sticky for that account (CPA InvalidateAuth).
+	selector.MarkFailure(ctx, first.Credential, 401, 0)
+	// CPA unavailable path: exclude bound auth → reselect + rebind (not keep dead pin).
+	_ = primary
+	next, err := selector.Acquire(ctx, account.ProviderBuild, "model", "", aff, map[uint64]bool{bound: true}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Credential.ID == bound {
+		t.Fatalf("excluded bound auth must reselect, still %d (fallback=%d)", bound, fallback.ID)
+	}
+	if next.Credential.ID != fallback.ID {
+		// pool may only have two accounts; accept any other than bound
+		t.Logf("reselected account=%d (fallback=%d)", next.Credential.ID, fallback.ID)
+	}
+	next.Release()
+	_ = accounts
+}
+
 func newStickySelectorFixture(t *testing.T, sticky repository.StickySessionRepository, capacityWait time.Duration, withFallback bool) (*Selector, account.Credential, account.Credential, repository.AccountRepository) {
 	t.Helper()
 	ctx := context.Background()

@@ -17,15 +17,15 @@ import (
 )
 
 type accountLease struct {
-	Credential          account.Credential
-	Billing             *account.Billing
-	QuotaProbe          bool
-	QuotaProbeKind      account.QuotaRecoveryKind
-	QuotaMode           string
+	Credential     account.Credential
+	Billing        *account.Billing
+	QuotaProbe     bool
+	QuotaProbeKind account.QuotaRecoveryKind
+	QuotaMode      string
 	// StickyMode explains how session affinity influenced this lease (for cache diagnostics).
 	// hit=bound account; borrow=temporary other account; rebind=forced new bind; bind=first bind; none=no affinity.
 	StickyMode          string
-	StickyBoundID        uint64 // original sticky account when borrow/rebind
+	StickyBoundID       uint64 // original sticky account when borrow/rebind
 	selectorObservation *selectorLeaseObservation
 	release             func()
 }
@@ -40,6 +40,7 @@ const (
 
 const quotaProbeLease = 5 * time.Minute
 const successPersistInterval = 30 * time.Second
+
 // candidateCacheTTL keeps the routing candidate snapshot warm across requests.
 // Token refresh must NOT wipe this cache (see UpdateTokens); secrets are rebound
 // per-request via accounts.Get after Acquire so a multi-minute TTL is safe and
@@ -179,18 +180,18 @@ func (l *accountLease) completeSelectorObservation(success bool) {
 
 // Selector 实现可替换的 balanced 账号选择策略。
 type Selector struct {
-	accounts               repository.AccountRepository
-	concurrency            repository.ConcurrencyLimiter
-	sticky                 repository.StickySessionRepository
-	stickyTTL              time.Duration
-	cooldownBase           time.Duration
-	cooldownMax            time.Duration
-	capacityWait           time.Duration
+	accounts     repository.AccountRepository
+	concurrency  repository.ConcurrencyLimiter
+	sticky       repository.StickySessionRepository
+	stickyTTL    time.Duration
+	cooldownBase time.Duration
+	cooldownMax  time.Duration
+	capacityWait time.Duration
 	// stickyCapacityWait is how long Acquire waits on a bound sticky account
 	// before temporary borrow. Zero means fall back to capacityWait.
-	stickyCapacityWait     time.Duration
+	stickyCapacityWait time.Duration
 	// minAccountConcurrent floors MaxConcurrent at claim time (0 = disabled).
-	minAccountConcurrent   int
+	minAccountConcurrent int
 	// loadFactor reports process in-flight load in [0,1+] for sticky-wait shedding.
 	loadFactor             func() float64
 	preferFreeBuild        bool
@@ -198,6 +199,10 @@ type Selector struct {
 	segmentedState         segmentedSelectorState
 	readyRingConfig        readyRingConfig
 	readyRingState         readyRingState
+	// sessionPins is a process-local fallback for sticky account affinity. The memory
+	// sticky store can prune under thrash; this map keeps the primary session→account
+	// pin so multi-turn prompt cache stays on one Build account until real failover.
+	sessionPins            sync.Map // sticky store key (string) -> accountID (uint64)
 	configMu               sync.RWMutex
 	candidateMu            sync.Mutex
 	selectionMu            sync.RWMutex
@@ -362,6 +367,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	}
 	// Non-sticky large pools: try O(window) ready-ring BEFORE O(N) full eligibility scan.
 	// Success path never materializes normalCandidates for tens of thousands of accounts.
+	// Sticky sessions must NEVER take ready-ring — that thrash kills xAI prompt cache.
 	if stickyKey == "" {
 		if lease, ringErr := s.acquireReadyRingDirect(ctx, values, quotaMode, provider, upstreamModel, excluded, now); ringErr != nil {
 			return nil, ringErr
@@ -437,7 +443,11 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		}
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
-	if len(probeCandidates) > 0 {
+	// Quota-recovery probes must not preempt sticky multi-turn sessions. Probing first
+	// returned StickyMode="" every request, force-bound a new account, and overwrote the
+	// session pin — exactly the ready-ring thrash that kills xAI prompt cache (CPA sticks
+	// the conversation to one auth until real quota death).
+	if len(probeCandidates) > 0 && stickyKey == "" {
 		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
@@ -471,14 +481,15 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	var stickyPreserveID uint64
 	var stickyRebindFrom uint64
 	if len(stickyKeys) > 0 {
-		stickyID, _, ok, err := s.stickyGetAny(ctx, stickyKeys, now)
+		stickyID, hitKey, ok, err := s.stickyGetAny(ctx, stickyKeys, now)
 		if err != nil {
 			return nil, fmt.Errorf("读取会话粘滞状态: %w", err)
 		}
 		if ok {
+			_ = hitKey
 			candidate, eligible := routingCandidateByID(values, normalCandidates, stickyID)
 			if eligible {
-				stickyTTL, _, _, _ := s.routingConfig()
+				stickyTTL := s.stickyTTLOrDefault()
 				boundID, bindErr := s.stickyBindAll(ctx, stickyKeys, stickyID, now, now.Add(stickyTTL))
 				if bindErr != nil {
 					return nil, fmt.Errorf("刷新会话粘滞状态: %w", bindErr)
@@ -568,7 +579,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			stickyMode := stickyModeNone
 			stickyBound := uint64(0)
 			if stickyKey != "" {
-				stickyTTL, _, _, _ := s.routingConfig()
+				stickyTTL := s.stickyTTLOrDefault()
 				if stickyPreserveID != 0 {
 					// Temporary borrow: refresh TTL on the original binding only (all dual keys).
 					if _, bindErr := s.stickyBindAll(ctx, stickyKeys, stickyPreserveID, currentTime, currentTime.Add(stickyTTL)); bindErr != nil {
@@ -656,23 +667,29 @@ func stickySessionKey(value string) string {
 
 // stickyKeysFromAffinity expands a (possibly dual) affinity key into sticky store keys.
 // Soft sessions may pass primary\x1efallback so turn-2+ inherits the turn-1 binding (CPA-style).
+// Always includes a stable "aff:<raw>" pin first so multi-turn cannot miss when dual-key
+// expansion or store prune would otherwise drop the hashed siblings.
 func stickyKeysFromAffinity(affinityKey string) []string {
+	affinityKey = strings.TrimSpace(affinityKey)
 	if affinityKey == "" {
 		return nil
 	}
-	parts := strings.Split(affinityKey, affinityKeySeparator)
-	keys := make([]string, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
-	for _, part := range parts {
-		key := stickySessionKey(part)
+	keys := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	add := func(key string) {
 		if key == "" {
-			continue
+			return
 		}
 		if _, ok := seen[key]; ok {
-			continue
+			return
 		}
 		seen[key] = struct{}{}
 		keys = append(keys, key)
+	}
+	// Raw affinity pin (process-local + store): survives dual-key primary rotation.
+	add("aff:" + affinityKey)
+	for _, part := range strings.Split(affinityKey, affinityKeySeparator) {
+		add(stickySessionKey(strings.TrimSpace(part)))
 	}
 	return keys
 }
@@ -684,7 +701,20 @@ func (s *Selector) stickyGetAny(ctx context.Context, keys []string, now time.Tim
 			return 0, "", false, getErr
 		}
 		if found {
+			pinSessionAccount(key, id)
+			s.sessionPins.Store(key, id)
 			return id, key, true, nil
+		}
+	}
+	// Fallback: process-local pin survives memory-store prune under thrash.
+	for _, key := range keys {
+		if id, pinned := lookupSessionPin(key); pinned {
+			return id, key, true, nil
+		}
+		if raw, pinned := s.sessionPins.Load(key); pinned {
+			if id, isID := raw.(uint64); isID && id != 0 {
+				return id, key, true, nil
+			}
 		}
 	}
 	return 0, "", false, nil
@@ -694,6 +724,10 @@ func (s *Selector) stickySetAll(ctx context.Context, keys []string, accountID ui
 	for _, key := range keys {
 		if err := s.sticky.Set(ctx, key, accountID, expiresAt); err != nil {
 			return err
+		}
+		pinSessionAccount(key, accountID)
+		if key != "" && accountID != 0 {
+			s.sessionPins.Store(key, accountID)
 		}
 	}
 	return nil
@@ -716,12 +750,72 @@ func (s *Selector) stickyBindAll(ctx context.Context, keys []string, proposedAcc
 	if err != nil {
 		return 0, err
 	}
+	pinSessionAccount(keys[0], boundID)
+	if keys[0] != "" && boundID != 0 {
+		s.sessionPins.Store(keys[0], boundID)
+	}
 	for _, key := range keys[1:] {
 		if err := s.sticky.Set(ctx, key, boundID, expiresAt); err != nil {
 			return 0, err
 		}
+		pinSessionAccount(key, boundID)
+		if key != "" && boundID != 0 {
+			s.sessionPins.Store(key, boundID)
+		}
 	}
 	return boundID, nil
+}
+
+
+// dropStickyForAccount clears store + process-local pins for a permanently failed account.
+func (s *Selector) dropStickyForAccount(ctx context.Context, accountID uint64) {
+	if accountID == 0 {
+		return
+	}
+	_ = s.sticky.DeleteByAccount(ctx, accountID)
+	s.clearSessionPinsForAccount(accountID)
+}
+
+// globalSessionPins is process-wide so a Selector pointer swap or future multi-selector
+// wiring cannot drop multi-turn account pins. Keyed by sticky store keys.
+var globalSessionPins sync.Map
+
+func pinSessionAccount(key string, accountID uint64) {
+	if key == "" || accountID == 0 {
+		return
+	}
+	globalSessionPins.Store(key, accountID)
+}
+
+func lookupSessionPin(key string) (uint64, bool) {
+	if key == "" {
+		return 0, false
+	}
+	raw, ok := globalSessionPins.Load(key)
+	if !ok {
+		return 0, false
+	}
+	id, ok := raw.(uint64)
+	return id, ok && id != 0
+}
+
+// clearSessionPinsForAccount drops process-local pins that point at accountID.
+func (s *Selector) clearSessionPinsForAccount(accountID uint64) {
+	if accountID == 0 {
+		return
+	}
+	s.sessionPins.Range(func(key, value any) bool {
+		if id, ok := value.(uint64); ok && id == accountID {
+			s.sessionPins.Delete(key)
+		}
+		return true
+	})
+	globalSessionPins.Range(func(key, value any) bool {
+		if id, ok := value.(uint64); ok && id == accountID {
+			globalSessionPins.Delete(key)
+		}
+		return true
+	})
 }
 
 func routingCandidateByID(values []account.RoutingCandidate, indexes []int, accountID uint64) (account.RoutingCandidate, bool) {
@@ -920,7 +1014,7 @@ func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential acco
 	})
 	// Drop from hot set while cooling; MarkSuccess after recovery re-admits it.
 	s.forgetProvenAccount(credential.ID)
-	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	s.dropStickyForAccount(ctx, credential.ID)
 	s.invalidateCandidates(credential.Provider)
 }
 
@@ -970,7 +1064,7 @@ func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential acc
 				AccountID: credential.ID, Kind: account.QuotaRecoveryKindPaid, Status: account.QuotaRecoveryStatusExhausted,
 				ExhaustedAt: &now, NextProbeAt: &periodEnd, LastConfirmedAt: &now, UpdatedAt: now,
 			})
-			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+			s.dropStickyForAccount(ctx, credential.ID)
 			s.invalidateCandidates(credential.Provider)
 			return
 		}
@@ -1013,7 +1107,7 @@ func (s *Selector) MarkSpendingLimitSoftCooldown(ctx context.Context, credential
 		})
 	}
 	s.forgetProvenAccount(credential.ID)
-	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	s.dropStickyForAccount(ctx, credential.ID)
 	s.invalidateCandidates(credential.Provider)
 }
 
@@ -1158,8 +1252,11 @@ func (s *Selector) MarkFailure(ctx context.Context, credential account.Credentia
 	until := time.Now().UTC().Add(cooldown)
 	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
 	s.invalidateCandidates(credential.Provider)
-	if status == 401 || status == 402 || status == 403 || status == 429 {
-		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	// Only clear sticky on permanent auth death. 402/429 are often transient (spending-limit
+	// egress rotate, capacity). Wiping every session pinned to this account forces ready-ring
+	// thrash and kills multi-turn prompt cache — the opposite of CPA stickiness.
+	if status == 401 || status == 403 {
+		s.dropStickyForAccount(ctx, credential.ID)
 	}
 }
 
@@ -1580,6 +1677,19 @@ func (s *Selector) acquirePinnedCapacityWithWait(ctx context.Context, value acco
 	}
 }
 
+// stickyTTLOrDefault returns the configured sticky TTL, floored to 1h.
+// A zero TTL makes memory sticky Bind a no-op (!now.Before(expiresAt)) so every
+// turn looks like a cold miss — catastrophic for sub2api multi-turn prompt cache.
+func (s *Selector) stickyTTLOrDefault() time.Duration {
+	s.configMu.RLock()
+	stickyTTL := s.stickyTTL
+	s.configMu.RUnlock()
+	if stickyTTL <= 0 {
+		return time.Hour
+	}
+	return stickyTTL
+}
+
 // RebindSticky forces the session affinity onto accountID. Used after a successful
 // request that permanently left the previous account (quota exhaust failover) so the
 // same prompt_cache_key warms cache on the new account for subsequent turns.
@@ -1588,21 +1698,17 @@ func (s *Selector) RebindSticky(ctx context.Context, affinityKey string, account
 	if len(keys) == 0 || accountID == 0 {
 		return nil
 	}
-	stickyTTL, _, _, _ := s.routingConfig()
-	return s.stickySetAll(ctx, keys, accountID, time.Now().UTC().Add(stickyTTL))
+	return s.stickySetAll(ctx, keys, accountID, time.Now().UTC().Add(s.stickyTTLOrDefault()))
 }
 
-// RefreshSticky preserves an existing binding when present; otherwise binds accountID.
-// Dual soft affinity keys are all refreshed onto the same account.
+// RefreshSticky writes/refreshes sticky bindings for all affinity keys onto accountID.
+// Uses Set (not Bind-with-zero-TTL no-op) so soft sessions always pin after a successful turn.
 func (s *Selector) RefreshSticky(ctx context.Context, affinityKey string, accountID uint64) error {
 	keys := stickyKeysFromAffinity(affinityKey)
 	if len(keys) == 0 || accountID == 0 {
 		return nil
 	}
-	stickyTTL, _, _, _ := s.routingConfig()
-	now := time.Now().UTC()
-	_, err := s.stickyBindAll(ctx, keys, accountID, now, now.Add(stickyTTL))
-	return err
+	return s.stickySetAll(ctx, keys, accountID, time.Now().UTC().Add(s.stickyTTLOrDefault()))
 }
 
 func (s *Selector) leaseReturnNotice() <-chan struct{} {

@@ -12,7 +12,12 @@ import (
 )
 
 const (
-	maxEntries        = 10000
+	// maxEntries bounds in-memory sticky/rate maps. Prompt-cache sticky is critical:
+	// soft dual-affinity thrashing used to create many short-lived keys and prune the
+	// stable upstream session pin (only ~157 slots/shard at 10k), so multi-turn always
+	// looked like sticky_mode=bind on a new account. Keep this large enough for tens of
+	// thousands of concurrent sessions × a few affinity keys each.
+	maxEntries        = 500_000
 	maxDeviceSessions = 1000
 	shardCount        = 64
 )

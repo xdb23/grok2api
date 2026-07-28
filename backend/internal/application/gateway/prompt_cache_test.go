@@ -131,3 +131,98 @@ func TestResolveBuildSessionIdentitySoftNormalizesWhitespace(t *testing.T) {
 		t.Fatalf("soft whitespace normalize failed: a=%#v b=%#v", a, b)
 	}
 }
+
+func TestComposeStickyAffinityKeyPinsUpstreamSession(t *testing.T) {
+	soft := resolveBuildSessionIdentity(7, accountdomain.ProviderBuild, "grok-4.5", "", "", []byte(`{"messages":[{"role":"user","content":"hello sticky"}]}`))
+	if soft.upstreamID == "" || soft.affinityKey == "" {
+		t.Fatalf("soft identity incomplete: %#v", soft)
+	}
+	composed := composeStickyAffinityKey(soft)
+	if composed == "" {
+		t.Fatal("composed sticky empty")
+	}
+	// Ownership-only identity (previous_response_id path) still gets sticky via upstream id.
+	owned := buildSessionIdentity{upstreamID: soft.upstreamID}
+	ownedSticky := composeStickyAffinityKey(owned)
+	if ownedSticky == "" {
+		t.Fatal("upstream-only identity must still produce sticky key")
+	}
+	softPrimary := strings.Split(composed, affinityKeySeparator)[0]
+	ownedPrimary := strings.Split(ownedSticky, affinityKeySeparator)[0]
+	if softPrimary != ownedPrimary {
+		t.Fatalf("upstream sticky primary mismatch: soft=%q owned=%q", softPrimary, ownedPrimary)
+	}
+}
+
+// CPA SessionAffinitySelector: same explicit session identity → same sticky keys across turns.
+func TestCPAStyleExplicitPromptCacheKeyStickyKeysStable(t *testing.T) {
+	turn1 := resolveBuildSessionIdentity(11, accountdomain.ProviderBuild, "grok-4.5", "client-pck-abc", "", nil)
+	turn2 := resolveBuildSessionIdentity(11, accountdomain.ProviderBuild, "grok-4.5", "client-pck-abc", "", []byte(`{"input":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"next"}]}`))
+	if turn1.upstreamID == "" || turn1.soft || turn1.upstreamID != turn2.upstreamID {
+		t.Fatalf("explicit prompt_cache_key must pin upstream across turns: t1=%#v t2=%#v", turn1, turn2)
+	}
+	if turn1.affinityKey != turn2.affinityKey {
+		t.Fatalf("explicit affinity must not drift: t1=%q t2=%q", turn1.affinityKey, turn2.affinityKey)
+	}
+	k1 := stickyKeysFromAffinity(composeStickyAffinityKey(turn1))
+	k2 := stickyKeysFromAffinity(composeStickyAffinityKey(turn2))
+	if len(k1) == 0 || len(k2) == 0 {
+		t.Fatalf("sticky keys empty: k1=%v k2=%v", k1, k2)
+	}
+	// Primary key (first) must match so store hit works without dual-key inheritance.
+	if k1[0] != k2[0] {
+		t.Fatalf("primary sticky key drifted: %q vs %q", k1[0], k2[0])
+	}
+	// Different client pck → different keys (CPA different sessions).
+	other := stickyKeysFromAffinity(composeStickyAffinityKey(resolveBuildSessionIdentity(11, accountdomain.ProviderBuild, "grok-4.5", "other-pck", "", nil)))
+	if other[0] == k1[0] {
+		t.Fatal("different prompt_cache_key must not share sticky primary")
+	}
+}
+
+// CPA extractMessageHashIDs dual inheritance: turn1 short key, turn2 full+fallback share store binding via fallback part.
+func TestCPAStyleSoftDualAffinityStickyKeyInheritance(t *testing.T) {
+	turn1Body := []byte(`{"messages":[{"role":"user","content":"cpa soft root message"}]}`)
+	turn2Body := []byte(`{"messages":[{"role":"user","content":"cpa soft root message"},{"role":"assistant","content":"ack"},{"role":"user","content":"follow up"}]}`)
+	t1 := resolveBuildSessionIdentity(42, accountdomain.ProviderBuild, "grok-4.5", "", "", turn1Body)
+	t2 := resolveBuildSessionIdentity(42, accountdomain.ProviderBuild, "grok-4.5", "", "", turn2Body)
+	if !t1.soft || !t2.soft || t1.upstreamID != t2.upstreamID {
+		t.Fatalf("soft multi-turn upstream unstable: t1=%#v t2=%#v", t1, t2)
+	}
+	// turn2 dual affinity must contain turn1 affinity as fallback (CPA short-hash inherit).
+	if t1.affinityKey == "" || (!strings.Contains(t2.affinityKey, t1.affinityKey) && t1.affinityKey != t2.affinityKey) {
+		t.Fatalf("turn2 must inherit turn1 soft affinity fallback: t1=%q t2=%q", t1.affinityKey, t2.affinityKey)
+	}
+	keys1 := stickyKeysFromAffinity(composeStickyAffinityKey(t1))
+	keys2 := stickyKeysFromAffinity(composeStickyAffinityKey(t2))
+	// Intersection non-empty: stickyGetAny on turn2 finds turn1 binding.
+	set := make(map[string]struct{}, len(keys1))
+	for _, k := range keys1 {
+		set[k] = struct{}{}
+	}
+	shared := false
+	for _, k := range keys2 {
+		if _, ok := set[k]; ok {
+			shared = true
+			break
+		}
+	}
+	if !shared {
+		t.Fatalf("no shared sticky keys for CPA dual inherit: keys1=%v keys2=%v", keys1, keys2)
+	}
+}
+
+func TestStickyKeysFromAffinityIncludesRawPinAndHashedParts(t *testing.T) {
+	// Mirrors CPA cache key stability: aff: raw pin first, then hashed siblings.
+	dual := "primarydigest" + affinityKeySeparator + "fallbackdigest"
+	keys := stickyKeysFromAffinity(dual)
+	if len(keys) < 2 {
+		t.Fatalf("expected aff pin + parts, got %v", keys)
+	}
+	if keys[0] != "aff:"+dual {
+		t.Fatalf("raw aff pin must be first: %q", keys[0])
+	}
+	if stickyKeysFromAffinity("") != nil {
+		t.Fatal("empty affinity must yield no keys")
+	}
+}

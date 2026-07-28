@@ -138,36 +138,36 @@ type proxyClientDropper interface {
 
 // Service handles model routing, account selection, failover, and audit finalization.
 type Service struct {
-	models               routeResolver
-	audits               auditRecorder
-	accounts             *accountapp.Service
-	clientKeys           *clientkeyapp.Service
-	providers            *provider.Registry
-	selector             *Selector
-	responses            repository.ResponseRepository
-	resinAdmin           resinLeaseRotator
-	proxyClients         proxyClientDropper
+	models       routeResolver
+	audits       auditRecorder
+	accounts     *accountapp.Service
+	clientKeys   *clientkeyapp.Service
+	providers    *provider.Registry
+	selector     *Selector
+	responses    repository.ResponseRepository
+	resinAdmin   resinLeaseRotator
+	proxyClients proxyClientDropper
 	// spendingLimitMaxEgressRotations: extra same-account Resin releases per request (default 3).
 	spendingLimitMaxEgressRotations atomic.Int64
 	// spendingLimitSoftCooldown: soft park duration after egress retries exhausted (default 1h).
-	spendingLimitSoftCooldown       atomic.Int64
-	maxAttempts          atomic.Int64
-	retryPolicy          atomic.Pointer[retryPolicySnapshot]
-	buildForbiddenReauth atomic.Pointer[buildForbiddenReauthPolicy]
-	requestTimeout       atomic.Int64
-	mediaJobs            repository.MediaJobRepository
-	mediaAssets          videoAssetStore
-	mediaQueue           chan string
-	mediaMu              sync.Mutex
-	mediaQueued          map[string]struct{}
-	mediaWorker          int
-	mediaQueueFull       atomic.Uint64
-	logger               *slog.Logger
-	rateLimitMu          sync.Mutex
-	rateLimits           map[string]teamModelRateLimit
-	rateLimitTeams       map[uint64]string
-	modelSyncMu          sync.Mutex
-	modelSyncing         map[uint64]struct{}
+	spendingLimitSoftCooldown atomic.Int64
+	maxAttempts               atomic.Int64
+	retryPolicy               atomic.Pointer[retryPolicySnapshot]
+	buildForbiddenReauth      atomic.Pointer[buildForbiddenReauthPolicy]
+	requestTimeout            atomic.Int64
+	mediaJobs                 repository.MediaJobRepository
+	mediaAssets               videoAssetStore
+	mediaQueue                chan string
+	mediaMu                   sync.Mutex
+	mediaQueued               map[string]struct{}
+	mediaWorker               int
+	mediaQueueFull            atomic.Uint64
+	logger                    *slog.Logger
+	rateLimitMu               sync.Mutex
+	rateLimits                map[string]teamModelRateLimit
+	rateLimitTeams            map[uint64]string
+	modelSyncMu               sync.Mutex
+	modelSyncing              map[uint64]struct{}
 }
 
 type teamModelRateLimit struct {
@@ -696,6 +696,8 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 			// do not recompute the soft key from this turn's incremental input.
 			identity.upstreamID = ownership.PromptCacheKey
 			identity.replayKey = ownership.ReasoningReplayKey
+			// Keep sticky on the same upstream session even when soft affinity is absent.
+			identity.affinityKey = ""
 		} else {
 			identity = resolveBuildSessionIdentity(
 				input.ClientKey.ID,
@@ -710,7 +712,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		explicitKeyLen := len(strings.TrimSpace(input.PromptCacheKey))
 		seedPresent := seedLen > 0 || explicitKeyLen > 0
 		input.PromptCacheKey = identity.upstreamID
-		affinityKey = identity.affinityKey
+		// Sticky must track the upstream session id (prompt_cache_key), not only soft
+		// affinity digests — sub2api multi-turn often lacks session headers and was
+		// thrashing accounts with sticky_mode=none despite a stable cache_key_prefix.
+		affinityKey = composeStickyAffinityKey(identity)
 		ownershipPromptCacheKey = identity.upstreamID
 		reasoningReplayKey = identity.replayKey
 		// Info-level so ops can see why multi-turn cache is cold (empty/soft/no sticky seed).
@@ -853,10 +858,23 @@ attemptLoop:
 			}
 			break
 		}
-		if affinityKey != "" {
+		// Ensure sticky is always written when we have a session identity.
+		// Some acquire paths (ready-ring / pin) leave StickyMode empty even though
+		// multi-turn prompt cache requires a stable account binding (sub2api soft sessions).
+		if affinityKey != "" && lease != nil {
 			mode := lease.StickyMode
-			if mode == "" {
-				mode = stickyModeNone
+			if mode == "" || mode == stickyModeNone {
+				if refreshErr := s.selector.RefreshSticky(ctx, affinityKey, lease.Credential.ID); refreshErr != nil {
+					s.logger.Warn("sticky_force_bind_failed",
+						"request_id", input.RequestID,
+						"account_id", lease.Credential.ID,
+						"error", refreshErr,
+					)
+				} else {
+					lease.StickyMode = stickyModeBind
+					lease.StickyBoundID = lease.Credential.ID
+					mode = stickyModeBind
+				}
 			}
 			level := slog.LevelInfo
 			if mode == stickyModeBorrow || mode == stickyModeRebind {
@@ -870,6 +888,8 @@ attemptLoop:
 				"sticky_bound_id", lease.StickyBoundID,
 				"attempt", attempt+1,
 				"cache_key_prefix", truncateForLog(input.PromptCacheKey, 12),
+				"affinity_fp", truncateForLog(affinityKey, 16),
+				"sticky_keys", len(stickyKeysFromAffinity(affinityKey)),
 			)
 		} else if route.Provider == accountdomain.ProviderBuild {
 			s.logger.Info("sticky_skipped_no_affinity",

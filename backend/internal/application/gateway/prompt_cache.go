@@ -29,7 +29,6 @@ type buildSessionIdentity struct {
 // affinityKeySeparator joins primary+fallback soft affinity digests (must not appear in hex digests).
 const affinityKeySeparator = "\x1e"
 
-
 // resolveBuildSessionIdentity derives a stable Grok Build session identity:
 // 1. Prefer explicit client session signals, isolated by client key, provider, and model.
 // 2. Fall back to system/instructions and the first user message when no explicit signal exists.
@@ -84,6 +83,41 @@ func resolveBuildSessionIdentity(clientKeyID uint64, provider accountdomain.Prov
 		affinityKey: affinityKey,
 		soft:        true,
 	}
+}
+
+// composeStickyAffinityKey builds sticky store keys that always track the upstream
+// prompt_cache_key (x-grok-conv-id). Soft dual-affinity digests alone can miss across
+// turns; pinning by upstreamID matches what xAI uses for cache and what sub2api multi-turn
+// needs when no explicit session header is forwarded.
+func composeStickyAffinityKey(identity buildSessionIdentity) string {
+	parts := make([]string, 0, 4)
+	if id := strings.TrimSpace(identity.upstreamID); id != "" {
+		// Stable primary: same key the CLI adapter injects as prompt_cache_key.
+		parts = append(parts, hexDigest("grok2api:build-sticky-upstream:v1:"+id))
+	}
+	if identity.affinityKey != "" {
+		for _, part := range strings.Split(identity.affinityKey, affinityKeySeparator) {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			parts = append(parts, part)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	// Dedup while preserving order (upstream first).
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if _, ok := seen[part]; ok {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return strings.Join(out, affinityKeySeparator)
 }
 
 // normalizeSoftUserAnchor stabilizes soft session keys across minor client formatting
